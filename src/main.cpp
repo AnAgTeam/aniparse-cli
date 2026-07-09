@@ -23,6 +23,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <print>
 #include <span>
@@ -49,8 +50,9 @@ int usage() {
 	    "  latest -p <parser> [--from N] [--limit N] [--sort KEY] [--asc]\n"
 	    "  search -p <parser> -q <query> [--filter k=v ...] [--from N] [--limit N]\n"
 	    "  parse <url>             route a URL to its source and fetch info\n"
-	    "  download [<url>] [--dest DIR] [--limit N]  save an image container's files\n"
-	    "                          (no <url>: read search/latest --json records from stdin)\n"
+	    "  download [<url>] [--dest DIR] [--limit N] [--chapters 1-4,8]  save files\n"
+	    "                          (image container, or manga chapters->pages;\n"
+	    "                           no <url>: read search/latest --json records from stdin)\n"
 	    "\n"
 	    "Global:\n"
 	    "  --json   emit machine-readable JSON instead of human text\n"
@@ -675,11 +677,107 @@ struct DumpResult {
 	boost::json::array written;
 };
 
-/// Fetch a container's items and write each image to @p dest via request()->body
-/// (whole image buffered — fine for stills; video/huge waits on streaming). The
-/// shared sink so a pasted URL (parse_url) and a piped serialize() handle
-/// (from_serialized) both funnel here; per-file progress prints as it goes, and
-/// the caller prints the final summary via report().
+/// Fetch one image via request()->body and write it into @p dir. The shared leaf
+/// of every download path (image container and manga page); whole image buffered
+/// — fine for stills, video/huge waits on streaming.
+void write_image(RequestorContext& ctx, const Image& image, const std::filesystem::path& dir,
+                 pageoff index, bool json, DumpResult& acc) {
+	auto resp = coro::sync_wait(ctx.request(GetRequest{ .url = image.url, .headers = image.headers }));
+	if (!resp || resp->status_code >= 400 || resp->body.empty()) {
+		++acc.failed;
+		std::println(stderr, "{}: item {} failed{}", program, static_cast<long long>(index),
+		    resp ? std::format(" (http {})", resp->status_code) : std::string{});
+		return;
+	}
+	const std::filesystem::path out = dir / filename_from_url(image.url, index);
+	std::ofstream file(out, std::ios::binary);
+	if (!file) {
+		++acc.failed;
+		std::println(stderr, "{}: cannot open {}", program, out.string());
+		return;
+	}
+	file.write(resp->body.data(), static_cast<std::streamsize>(resp->body.size()));
+	++acc.ok;
+	if (json) {
+		acc.written.emplace_back(out.string());
+	} else {
+		std::println("  {} ({} bytes)", out.string(), resp->body.size());
+	}
+}
+
+/// Replace characters a path segment can't hold on Windows/POSIX with '_'.
+std::string sanitize_segment(std::string_view s) {
+	std::string out;
+	for (const char c : s) {
+		const bool bad = c == '/' || c == '\\' || c == ':' || c == '*' || c == '?'
+		              || c == '"' || c == '<' || c == '>' || c == '|';
+		out += bad ? '_' : c;
+	}
+	return out;
+}
+
+/// A per-chapter subdirectory name: the source's own number when it has one,
+/// else vol/chapter, else the 1-based index; the title is appended when present.
+std::string chapter_dirname(const MangaChapterInfo& ch, std::size_t index) {
+	std::string label;
+	if (!ch.number.empty()) {
+		label = "ch" + ch.number;
+	} else if (ch.chapter != 0 || ch.volume != 0) {
+		label = "vol" + std::to_string(ch.volume) + "_ch" + std::to_string(ch.chapter);
+	} else {
+		label = "chapter_" + std::to_string(index + 1);
+	}
+	if (!ch.name.empty()) {
+		label += "_" + ch.name;
+	}
+	return sanitize_segment(label);
+}
+
+/// Parse a chapter range spec ("1-4,8,11", 1-based) into 0-based indices within
+/// [0,count). Empty or "all" selects everything. nullopt (after printing) on a
+/// malformed spec.
+std::optional<std::vector<std::size_t>> parse_ranges(std::string_view spec, std::size_t count) {
+	std::vector<std::size_t> out;
+	if (spec.empty() || spec == "all") {
+		out.resize(count);
+		std::iota(out.begin(), out.end(), std::size_t{ 0 });
+		return out;
+	}
+	std::size_t pos = 0;
+	while (pos < spec.size()) {
+		const std::size_t comma = spec.find(',', pos);
+		const std::string_view tok =
+		    spec.substr(pos, comma == std::string_view::npos ? std::string_view::npos : comma - pos);
+		pos = (comma == std::string_view::npos) ? spec.size() : comma + 1;
+		if (tok.empty()) {
+			continue;
+		}
+		const std::size_t dash = tok.find('-');
+		if (dash == std::string_view::npos) {
+			const auto n = parse_uint(tok);
+			if (!n || *n < 1) {
+				std::println(stderr, "{}: bad chapter range '{}'", program, tok);
+				return std::nullopt;
+			}
+			if (static_cast<std::size_t>(*n) <= count) {
+				out.push_back(static_cast<std::size_t>(*n) - 1);
+			}
+		} else {
+			const auto lo = parse_uint(tok.substr(0, dash));
+			const auto hi = parse_uint(tok.substr(dash + 1));
+			if (!lo || !hi || *lo < 1 || *hi < *lo) {
+				std::println(stderr, "{}: bad chapter range '{}'", program, tok);
+				return std::nullopt;
+			}
+			for (long long i = *lo; i <= *hi && static_cast<std::size_t>(i) <= count; ++i) {
+				out.push_back(static_cast<std::size_t>(i) - 1);
+			}
+		}
+	}
+	return out;
+}
+
+/// Fetch an image container's items and write each into @p dest.
 void dump_container(RequestorContext& ctx, ImageContainerGetter& container,
                     const std::string& dest, GetFilters filters, bool json, DumpResult& acc) {
 	auto items = coro::sync_wait(container.items(ctx, filters));
@@ -688,33 +786,47 @@ void dump_container(RequestorContext& ctx, ImageContainerGetter& container,
 		++acc.failed;
 		return;
 	}
-
 	std::error_code ec;
 	std::filesystem::create_directories(dest, ec);
-
 	for (auto& entry : items->results) {
-		const Image& image = entry.item.image;
-		auto resp = coro::sync_wait(ctx.request(GetRequest{ .url = image.url, .headers = image.headers }));
-		if (!resp || resp->status_code >= 400 || resp->body.empty()) {
+		write_image(ctx, entry.item.image, dest, entry.offset, json, acc);
+	}
+}
+
+/// Fetch a manga's chapters (those selected by @p chapters_spec) and write each
+/// chapter's pages into a <dest>/<chapter> subdirectory.
+void dump_manga(RequestorContext& ctx, MangaGetter& manga, const std::string& dest,
+                std::string_view chapters_spec, bool json, DumpResult& acc) {
+	auto chapters = coro::sync_wait(manga.chapters_info(ctx, GetFilters{}));
+	if (!chapters) {
+		std::println(stderr, "{}: chapters failed: {}", program, chapters.error().message);
+		++acc.failed;
+		return;
+	}
+	const auto& list = chapters->results;
+	const std::optional<std::vector<std::size_t>> selected = parse_ranges(chapters_spec, list.size());
+	if (!selected) {
+		++acc.failed;
+		return;
+	}
+
+	for (const std::size_t idx : *selected) {
+		const MangaChapterInfo& ch = list[idx].item;
+		const std::filesystem::path dir = std::filesystem::path(dest) / chapter_dirname(ch, idx);
+		std::error_code ec;
+		std::filesystem::create_directories(dir, ec);
+
+		auto pages = coro::sync_wait(manga.chapter_pages(ctx, ch.ref(), GetFilters{}));
+		if (!pages) {
+			std::println(stderr, "{}: chapter {} pages failed: {}", program, idx + 1,
+			    pages.error().message);
 			++acc.failed;
-			std::println(stderr, "{}: item {} failed{}", program, static_cast<long long>(entry.offset),
-			    resp ? std::format(" (http {})", resp->status_code) : std::string{});
 			continue;
 		}
-		const std::filesystem::path out =
-		    std::filesystem::path(dest) / filename_from_url(image.url, entry.offset);
-		std::ofstream file(out, std::ios::binary);
-		if (!file) {
-			++acc.failed;
-			std::println(stderr, "{}: cannot open {}", program, out.string());
-			continue;
-		}
-		file.write(resp->body.data(), static_cast<std::streamsize>(resp->body.size()));
-		++acc.ok;
-		if (json) {
-			acc.written.emplace_back(out.string());
-		} else {
-			std::println("  {} ({} bytes)", out.string(), resp->body.size());
+		std::println("Chapter {} ({} pages)", ch.number.empty() ? std::to_string(idx + 1) : ch.number,
+		    pages->results.size());
+		for (auto& page : pages->results) {
+			write_image(ctx, page.item.image, dir, page.offset, json, acc);
 		}
 	}
 }
@@ -736,7 +848,8 @@ int report(DumpResult result, const std::string& dest, bool json) {
 /// Rebuild a container from one piped {parser, handle} record (as emitted by
 /// search/latest --json) and dump it into @p acc via from_serialized.
 void dump_serialized(ParserStore& store, RequestorContext& ctx, const boost::json::object& record,
-                     const std::string& dest, GetFilters filters, bool json, DumpResult& acc) {
+                     const std::string& dest, GetFilters filters, std::string_view chapters_spec,
+                     bool json, DumpResult& acc) {
 	const auto* parser_field = record.if_contains("parser");
 	const auto* handle_field = record.if_contains("handle");
 	if (!parser_field || !parser_field->is_string() || !handle_field || !handle_field->is_object()) {
@@ -753,8 +866,10 @@ void dump_serialized(ParserStore& store, RequestorContext& ctx, const boost::jso
 	}
 	using namespace compatibilities_flags;
 	const CompatibilitiesFlags flags = parser->compatibilities().flags;
-	if (!flags.has(supports_images_store) && !flags.has(supports_images_search)) {
-		std::println(stderr, "{}: skipping non-image parser '{}'", program, pid);
+	const bool is_images = flags.has(supports_images_store) || flags.has(supports_images_search);
+	const bool is_manga  = flags.has(supports_manga_store);
+	if (!is_images && !is_manga) {
+		std::println(stderr, "{}: skipping parser '{}' (no downloadable category)", program, pid);
 		++acc.failed;
 		return;
 	}
@@ -773,14 +888,25 @@ void dump_serialized(ParserStore& store, RequestorContext& ctx, const boost::jso
 	}
 
 	RequestorContext ready = ctx.new_with_config(parser->make_config(ctx.config()));
-	auto root = parser->images_getter();
-	auto getter = coro::sync_wait(root->from_serialized(std::move(data)));
-	if (!getter) {
-		std::println(stderr, "{}: from_serialized failed for '{}': {}", program, pid, getter.error().message);
-		++acc.failed;
-		return;
+	if (is_images) {
+		auto root = parser->images_getter();
+		auto getter = coro::sync_wait(root->from_serialized(std::move(data)));
+		if (!getter) {
+			std::println(stderr, "{}: from_serialized failed for '{}': {}", program, pid, getter.error().message);
+			++acc.failed;
+			return;
+		}
+		dump_container(ready, **getter, dest, filters, json, acc);
+	} else {
+		auto root = parser->mangas_getter();
+		auto getter = coro::sync_wait(root->from_serialized(std::move(data)));
+		if (!getter) {
+			std::println(stderr, "{}: from_serialized failed for '{}': {}", program, pid, getter.error().message);
+			++acc.failed;
+			return;
+		}
+		dump_manga(ready, **getter, dest, chapters_spec, json, acc);
 	}
-	dump_container(ready, **getter, dest, filters, json, acc);
 }
 
 int download(std::span<const std::string_view> args, bool json) {
@@ -789,7 +915,7 @@ int download(std::span<const std::string_view> args, bool json) {
 	std::optional<std::string_view> url;
 	for (std::size_t i = 0; i < args.size(); ++i) {
 		const std::string_view a = args[i];
-		if (a == "--dest" || a == "--limit") {
+		if (a == "--dest" || a == "--limit" || a == "--chapters") {
 			++i; // consume the flag's value
 			continue;
 		}
@@ -812,32 +938,45 @@ int download(std::span<const std::string_view> args, bool json) {
 		}
 		filters.limit = static_cast<std::size_t>(*n);
 	}
+	std::string chapters_spec; // manga only; empty = all chapters
+	if (const auto c = flag_value(args, "--chapters")) {
+		chapters_spec = std::string(*c);
+	}
 
 	ParserStore store;
 	populate_store(store);
 	auto client = std::make_shared<AsyncClient>();
 	RequestorContext ctx(client);
 
-	// URL mode: a pasted container URL.
+	// URL mode: a pasted container / manga URL.
 	if (url) {
 		std::optional<UrlRoute> route = store.route_url(*url);
 		if (!route) {
 			std::println(stderr, "{}: no source handles '{}'", program, *url);
 			return Runtime;
 		}
-		if (route->type != GetterSuggestionType::Images) {
-			std::println(stderr, "{}: download currently supports image containers only", program);
+		RequestorContext ready = ctx.new_with_config(route->parser->make_config(ctx.config()));
+		DumpResult result;
+		if (route->type == GetterSuggestionType::Images) {
+			auto root = route->parser->images_getter();
+			auto getter = coro::sync_wait(root->parse_url(ready, std::move(route->url)));
+			if (!getter) {
+				std::println(stderr, "{}: parse failed: {}", program, getter.error().message);
+				return Runtime;
+			}
+			dump_container(ready, **getter, dest, filters, json, result);
+		} else if (route->type == GetterSuggestionType::Manga) {
+			auto root = route->parser->mangas_getter();
+			auto getter = coro::sync_wait(root->parse_url(ready, std::move(route->url)));
+			if (!getter) {
+				std::println(stderr, "{}: parse failed: {}", program, getter.error().message);
+				return Runtime;
+			}
+			dump_manga(ready, **getter, dest, chapters_spec, json, result);
+		} else {
+			std::println(stderr, "{}: download supports image and manga URLs", program);
 			return Usage;
 		}
-		RequestorContext ready = ctx.new_with_config(route->parser->make_config(ctx.config()));
-		auto root = route->parser->images_getter();
-		auto getter = coro::sync_wait(root->parse_url(ready, std::move(route->url)));
-		if (!getter) {
-			std::println(stderr, "{}: parse failed: {}", program, getter.error().message);
-			return Runtime;
-		}
-		DumpResult result;
-		dump_container(ready, **getter, dest, filters, json, result);
 		return report(std::move(result), dest, json);
 	}
 
@@ -859,7 +998,9 @@ int download(std::span<const std::string_view> args, bool json) {
 	try {
 		doc = boost::json::parse(input);
 	} catch (const std::exception& e) {
-		std::println(stderr, "{}: could not parse stdin as JSON: {}", program, e.what());
+		std::println(stderr, "{}: stdin is not valid JSON ({}).", program, e.what());
+		std::println(stderr, "{}: pipe search/latest with --json, e.g. "
+		    "`{} --json search -p X -q foo | {} download`", program, program, program);
 		return Usage;
 	}
 
@@ -867,11 +1008,11 @@ int download(std::span<const std::string_view> args, bool json) {
 	if (doc.is_array()) {
 		for (const auto& v : doc.as_array()) {
 			if (v.is_object()) {
-				dump_serialized(store, ctx, v.as_object(), dest, filters, json, result);
+				dump_serialized(store, ctx, v.as_object(), dest, filters, chapters_spec, json, result);
 			}
 		}
 	} else if (doc.is_object()) {
-		dump_serialized(store, ctx, doc.as_object(), dest, filters, json, result);
+		dump_serialized(store, ctx, doc.as_object(), dest, filters, chapters_spec, json, result);
 	} else {
 		std::println(stderr, "{}: stdin JSON must be an object or array of records", program);
 		return Usage;
