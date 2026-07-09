@@ -1,0 +1,4 @@
+[submodule "aniparse-parsers"]
+	path = aniparse-parsers
+	url = https://github.com/AnAgTeam/aniparse-parsers.git
+	branch = nightly
