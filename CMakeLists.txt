@@ -19,12 +19,54 @@ set(ANIPARSE_PARSERS_BUILD_TESTS    OFF CACHE BOOL "" FORCE)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
 find_package(aniparse-parsers REQUIRED)
 
+# ---- EXTENSION SEAM (A): static composition of extra parser sets
+#
+# The public binary ships only the showcase parsers. To build your own anip with
+# additional (e.g. private) parsers, point these at an extension library that
+# exposes a registrar `void reg(aniparse::ParserStore&)` — no dynamic loading, so
+# no ABI/RCE surface; the extension is compiled and linked like any other target.
+#
+#   cmake --preset x64-debug \
+#     -D ANIP_EXTENSION_SUBDIRS="../my-extensions" \
+#     -D ANIP_EXTENSION_LIBS="my-extensions" \
+#     -D ANIP_EXTENSION_HEADERS="my/extensions/Register.hpp" \
+#     -D ANIP_EXTENSION_REGISTRARS="myext::emplace_my_parsers"
+set(ANIP_EXTENSION_SUBDIRS    "" CACHE STRING "Source dirs to add_subdirectory before linking anip")
+set(ANIP_EXTENSION_LIBS       "" CACHE STRING "Extra targets to link into anip")
+set(ANIP_EXTENSION_HEADERS    "" CACHE STRING "Headers declaring the extension registrar functions")
+set(ANIP_EXTENSION_REGISTRARS "" CACHE STRING "Registrar functions, each void(aniparse::ParserStore&)")
+
+# Bring extension targets into the build (unique binary dir per entry, since the
+# source dirs typically live outside this tree).
+set(_anip_ext_i 0)
+foreach(_dir IN LISTS ANIP_EXTENSION_SUBDIRS)
+	add_subdirectory("${_dir}" "${CMAKE_CURRENT_BINARY_DIR}/anip-ext-${_anip_ext_i}")
+	math(EXPR _anip_ext_i "${_anip_ext_i}+1")
+endforeach()
+
+# Expand the header/registrar lists into the generated composition header.
+set(ANIP_EXTENSION_INCLUDES "")
+foreach(_hdr IN LISTS ANIP_EXTENSION_HEADERS)
+	string(APPEND ANIP_EXTENSION_INCLUDES "#include \"${_hdr}\"\n")
+endforeach()
+set(ANIP_EXTENSION_CALLS "")
+foreach(_reg IN LISTS ANIP_EXTENSION_REGISTRARS)
+	string(APPEND ANIP_EXTENSION_CALLS "\t${_reg}(store);\n")
+endforeach()
+configure_file(
+	"${CMAKE_CURRENT_LIST_DIR}/cmake/anip_extensions.hpp.in"
+	"${CMAKE_CURRENT_BINARY_DIR}/generated/anip_extensions.hpp"
+	@ONLY)
+
 add_executable(anip
 	"src/main.cpp"
 )
 
 set_property(TARGET anip PROPERTY CXX_STANDARD 23)
 set_property(TARGET anip PROPERTY CXX_STANDARD_REQUIRED ON)
+
+# The generated seam header lives in the build tree.
+target_include_directories(anip PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
 
 # Hold the CLI to the same warning bar as the core and the parsers.
 target_compile_options(anip PRIVATE
@@ -33,5 +75,5 @@ target_compile_options(anip PRIVATE
 )
 
 # aniparse-parsers PUBLIC-links aniparse, so linking it transitively brings the
-# core target, its headers, and boost::json.
-target_link_libraries(anip PRIVATE aniparse-parsers aniparse)
+# core target, its headers, and boost::json. Extension libs (if any) link too.
+target_link_libraries(anip PRIVATE aniparse-parsers aniparse ${ANIP_EXTENSION_LIBS})

@@ -9,6 +9,8 @@
 #include <aniparse/ParserStore.hpp>
 #include <aniparse/parsers/DefaultParsers.hpp>
 
+#include "anip_extensions.hpp" // generated: register_extensions (seam A)
+
 #include <boost/json.hpp>
 
 #include <print>
@@ -70,9 +72,16 @@ std::string join(const std::vector<std::string_view>& parts, std::string_view se
 	return out;
 }
 
+/// Build a store: the public showcase parsers plus any extension parser sets
+/// linked into this build (seam A — see cmake/anip_extensions.hpp.in).
+void populate_store(ParserStore& store) {
+	parsers::emplace_default_parsers(store);
+	anip::register_extensions(store);
+}
+
 int list_parsers(bool json) {
 	ParserStore store;
-	parsers::emplace_default_parsers(store);
+	populate_store(store);
 	const std::vector<std::shared_ptr<Parser>> parser_list = store.parsers();
 
 	if (json) {

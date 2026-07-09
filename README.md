@@ -27,6 +27,35 @@ cmake --preset x64-debug
 cmake --build out/build/x64-debug
 ```
 
+## Bring your own parsers
+
+The public binary ships only the showcase parsers. To build your own `anip` with
+extra (e.g. private) sources, point it at an extension library that exposes a
+registrar `void reg(aniparse::ParserStore&)`. This is **static composition** — the
+extension is compiled and linked like any other target, so there is no dynamic
+loading and no ABI/RCE surface. Four cache variables drive it:
+
+```
+cmake --preset x64-debug \
+  -D ANIP_EXTENSION_SUBDIRS="/path/to/my-extensions" \  # add_subdirectory'd
+  -D ANIP_EXTENSION_LIBS="my-ext" \                     # target(s) to link
+  -D ANIP_EXTENSION_HEADERS="myext/Register.hpp" \      # declares the registrar
+  -D ANIP_EXTENSION_REGISTRARS="myext::emplace_my_parsers"
+```
+
+Each registrar is called after the default set, so your parsers join the store
+alongside the showcase ones. A registrar is just:
+
+```cpp
+// myext/Register.hpp
+namespace myext { void emplace_my_parsers(aniparse::ParserStore& store); }
+```
+
+Runtime plugin loading (`--extensions <dir>`) is intentionally not offered here:
+loading arbitrary native code is a code-execution channel, and the C++ ABI across
+a shared-library boundary is fragile. If it lands later it will be a narrow,
+opt-in C entry point over this same registrar seam.
+
 ## Commands
 
 | Command | Status |
