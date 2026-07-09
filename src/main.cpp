@@ -21,6 +21,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <iostream>
 #include <memory>
 #include <optional>
 #include <print>
@@ -48,7 +49,8 @@ int usage() {
 	    "  latest -p <parser> [--from N] [--limit N] [--sort KEY] [--asc]\n"
 	    "  search -p <parser> -q <query> [--filter k=v ...] [--from N] [--limit N]\n"
 	    "  parse <url>             route a URL to its source and fetch info\n"
-	    "  download <url> [--dest DIR] [--limit N]   save an image container's files\n"
+	    "  download [<url>] [--dest DIR] [--limit N]  save an image container's files\n"
+	    "                          (no <url>: read search/latest --json records from stdin)\n"
 	    "\n"
 	    "Global:\n"
 	    "  --json   emit machine-readable JSON instead of human text\n"
@@ -204,9 +206,11 @@ std::optional<GetFilters> parse_filters(std::span<const std::string_view> args) 
 /// Print a fetched page of container getters (shared by latest and search).
 /// Templated over the awaited result so one body serves both manga and images:
 /// latest()/search() return the same PageResults<unique_ptr<...>> and both leaf
-/// infos expose .title (fetched per item via preview_info).
+/// infos expose .title (fetched per item via preview_info). In --json each row
+/// also carries the parser id + the item's serialize() handle, so the output
+/// pipes straight into `download` (which rebuilds the getter via from_serialized).
 template <typename PageResult>
-int emit_page(RequestorContext& ctx, PageResult page, bool json) {
+int emit_page(RequestorContext& ctx, PageResult page, std::string_view parser_id, bool json) {
 	if (!page) {
 		std::println(stderr, "{}: request failed: {}", program, page.error().message);
 		return Runtime;
@@ -224,6 +228,19 @@ int emit_page(RequestorContext& ctx, PageResult page, bool json) {
 			boost::json::object o;
 			o["offset"] = static_cast<std::int64_t>(entry.offset);
 			o["title"]  = info->title;
+			o["parser"] = std::string(parser_id);
+			// The opaque persistence handle (serialize()), not a URL — download
+			// feeds it back through from_serialized. @see [[serialize-vs-parse-url]]
+			if (auto handle = coro::sync_wait(entry.item->serialize())) {
+				boost::json::object h;
+				h["url"] = handle->url;
+				boost::json::object params;
+				for (const auto& [key, value] : handle->params) {
+					params[key] = value;
+				}
+				h["params"] = std::move(params);
+				o["handle"] = std::move(h);
+			}
 			arr.push_back(std::move(o));
 		} else {
 			std::println("{:>4}  {}", static_cast<long long>(entry.offset), info->title);
@@ -266,11 +283,11 @@ int latest(std::span<const std::string_view> args, bool json) {
 	const CompatibilitiesFlags flags = parser->compatibilities().flags;
 	if (flags.has(supports_manga_store)) {
 		auto root = parser->mangas_getter();
-		return emit_page(ready, coro::sync_wait(root->latest(ready, *filters)), json);
+		return emit_page(ready, coro::sync_wait(root->latest(ready, *filters)), parser->identifier(), json);
 	}
 	if (flags.has(supports_images_store) || flags.has(supports_images_search)) {
 		auto root = parser->images_getter();
-		return emit_page(ready, coro::sync_wait(root->latest(ready, *filters)), json);
+		return emit_page(ready, coro::sync_wait(root->latest(ready, *filters)), parser->identifier(), json);
 	}
 	std::println(stderr, "{}: parser '{}' has no browsable latest feed", program, *pkey);
 	return Usage;
@@ -313,11 +330,11 @@ int search(std::span<const std::string_view> args, bool json) {
 	const CompatibilitiesFlags flags = parser->compatibilities().flags;
 	if (flags.has(supports_manga_store)) {
 		auto root = parser->mangas_getter();
-		return emit_page(ready, coro::sync_wait(root->search(ready, request, *filters)), json);
+		return emit_page(ready, coro::sync_wait(root->search(ready, request, *filters)), parser->identifier(), json);
 	}
 	if (flags.has(supports_images_search)) {
 		auto root = parser->images_getter();
-		return emit_page(ready, coro::sync_wait(root->search(ready, request, *filters)), json);
+		return emit_page(ready, coro::sync_wait(root->search(ready, request, *filters)), parser->identifier(), json);
 	}
 	std::println(stderr, "{}: parser '{}' does not support search", program, *pkey);
 	return Usage;
@@ -652,29 +669,34 @@ std::string filename_from_url(std::string_view url, pageoff index) {
 	return std::string(base);
 }
 
+struct DumpResult {
+	int ok = 0;
+	int failed = 0;
+	boost::json::array written;
+};
+
 /// Fetch a container's items and write each image to @p dest via request()->body
 /// (whole image buffered — fine for stills; video/huge waits on streaming). The
-/// shared sink so a URL (parse_url) and later a serialized handle (from_serialized)
-/// both funnel here.
-int dump_container(RequestorContext& ctx, ImageContainerGetter& container,
-                   const std::string& dest, GetFilters filters, bool json) {
+/// shared sink so a pasted URL (parse_url) and a piped serialize() handle
+/// (from_serialized) both funnel here; per-file progress prints as it goes, and
+/// the caller prints the final summary via report().
+void dump_container(RequestorContext& ctx, ImageContainerGetter& container,
+                    const std::string& dest, GetFilters filters, bool json, DumpResult& acc) {
 	auto items = coro::sync_wait(container.items(ctx, filters));
 	if (!items) {
 		std::println(stderr, "{}: items failed: {}", program, items.error().message);
-		return Runtime;
+		++acc.failed;
+		return;
 	}
 
 	std::error_code ec;
 	std::filesystem::create_directories(dest, ec);
 
-	boost::json::array written;
-	int ok = 0;
-	int failed = 0;
 	for (auto& entry : items->results) {
 		const Image& image = entry.item.image;
 		auto resp = coro::sync_wait(ctx.request(GetRequest{ .url = image.url, .headers = image.headers }));
 		if (!resp || resp->status_code >= 400 || resp->body.empty()) {
-			++failed;
+			++acc.failed;
 			std::println(stderr, "{}: item {} failed{}", program, static_cast<long long>(entry.offset),
 			    resp ? std::format(" (http {})", resp->status_code) : std::string{});
 			continue;
@@ -683,43 +705,99 @@ int dump_container(RequestorContext& ctx, ImageContainerGetter& container,
 		    std::filesystem::path(dest) / filename_from_url(image.url, entry.offset);
 		std::ofstream file(out, std::ios::binary);
 		if (!file) {
-			++failed;
+			++acc.failed;
 			std::println(stderr, "{}: cannot open {}", program, out.string());
 			continue;
 		}
 		file.write(resp->body.data(), static_cast<std::streamsize>(resp->body.size()));
-		++ok;
+		++acc.ok;
 		if (json) {
-			written.emplace_back(out.string());
+			acc.written.emplace_back(out.string());
 		} else {
 			std::println("  {} ({} bytes)", out.string(), resp->body.size());
 		}
 	}
+}
 
+int report(DumpResult result, const std::string& dest, bool json) {
 	if (json) {
 		boost::json::object o;
-		o["written"] = std::move(written);
-		o["ok"]      = ok;
-		o["failed"]  = failed;
+		o["written"] = std::move(result.written);
+		o["ok"]      = result.ok;
+		o["failed"]  = result.failed;
 		std::println("{}", boost::json::serialize(boost::json::value(std::move(o))));
 	} else {
-		std::println("Downloaded {} file(s) to {}{}", ok, dest,
-		    failed > 0 ? std::format(" ({} failed)", failed) : std::string{});
+		std::println("Downloaded {} file(s) to {}{}", result.ok, dest,
+		    result.failed > 0 ? std::format(" ({} failed)", result.failed) : std::string{});
 	}
-	return (ok == 0 && failed > 0) ? Runtime : Ok;
+	return (result.ok == 0 && result.failed > 0) ? Runtime : Ok;
+}
+
+/// Rebuild a container from one piped {parser, handle} record (as emitted by
+/// search/latest --json) and dump it into @p acc via from_serialized.
+void dump_serialized(ParserStore& store, RequestorContext& ctx, const boost::json::object& record,
+                     const std::string& dest, GetFilters filters, bool json, DumpResult& acc) {
+	const auto* parser_field = record.if_contains("parser");
+	const auto* handle_field = record.if_contains("handle");
+	if (!parser_field || !parser_field->is_string() || !handle_field || !handle_field->is_object()) {
+		std::println(stderr, "{}: skipping record without parser/handle", program);
+		++acc.failed;
+		return;
+	}
+	const std::string pid(parser_field->as_string().c_str());
+	const std::shared_ptr<Parser> parser = store.find_by_key(pid);
+	if (!parser) {
+		std::println(stderr, "{}: skipping unknown parser '{}'", program, pid);
+		++acc.failed;
+		return;
+	}
+	using namespace compatibilities_flags;
+	const CompatibilitiesFlags flags = parser->compatibilities().flags;
+	if (!flags.has(supports_images_store) && !flags.has(supports_images_search)) {
+		std::println(stderr, "{}: skipping non-image parser '{}'", program, pid);
+		++acc.failed;
+		return;
+	}
+
+	SerializedGetterData data;
+	const boost::json::object& handle = handle_field->as_object();
+	if (const auto* u = handle.if_contains("url"); u && u->is_string()) {
+		data.url = u->as_string().c_str();
+	}
+	if (const auto* p = handle.if_contains("params"); p && p->is_object()) {
+		for (const auto& [key, value] : p->as_object()) {
+			if (value.is_string()) {
+				data.params[std::string(key)] = value.as_string().c_str();
+			}
+		}
+	}
+
+	RequestorContext ready = ctx.new_with_config(parser->make_config(ctx.config()));
+	auto root = parser->images_getter();
+	auto getter = coro::sync_wait(root->from_serialized(std::move(data)));
+	if (!getter) {
+		std::println(stderr, "{}: from_serialized failed for '{}': {}", program, pid, getter.error().message);
+		++acc.failed;
+		return;
+	}
+	dump_container(ready, **getter, dest, filters, json, acc);
 }
 
 int download(std::span<const std::string_view> args, bool json) {
+	// First positional (non-flag) token is the URL; skip the value-taking flags so
+	// their arguments aren't mistaken for it.
 	std::optional<std::string_view> url;
-	for (const std::string_view a : args) {
-		if (!a.starts_with('-')) {
-			url = a;
-			break;
+	for (std::size_t i = 0; i < args.size(); ++i) {
+		const std::string_view a = args[i];
+		if (a == "--dest" || a == "--limit") {
+			++i; // consume the flag's value
+			continue;
 		}
-	}
-	if (!url) {
-		std::println(stderr, "{}: download needs a <url>", program);
-		return Usage;
+		if (a.starts_with('-')) {
+			continue;
+		}
+		url = a;
+		break;
 	}
 	std::string dest = ".";
 	if (const auto d = flag_value(args, "--dest")) {
@@ -737,27 +815,68 @@ int download(std::span<const std::string_view> args, bool json) {
 
 	ParserStore store;
 	populate_store(store);
-	std::optional<UrlRoute> route = store.route_url(*url);
-	if (!route) {
-		std::println(stderr, "{}: no source handles '{}'", program, *url);
-		return Runtime;
+	auto client = std::make_shared<AsyncClient>();
+	RequestorContext ctx(client);
+
+	// URL mode: a pasted container URL.
+	if (url) {
+		std::optional<UrlRoute> route = store.route_url(*url);
+		if (!route) {
+			std::println(stderr, "{}: no source handles '{}'", program, *url);
+			return Runtime;
+		}
+		if (route->type != GetterSuggestionType::Images) {
+			std::println(stderr, "{}: download currently supports image containers only", program);
+			return Usage;
+		}
+		RequestorContext ready = ctx.new_with_config(route->parser->make_config(ctx.config()));
+		auto root = route->parser->images_getter();
+		auto getter = coro::sync_wait(root->parse_url(ready, std::move(route->url)));
+		if (!getter) {
+			std::println(stderr, "{}: parse failed: {}", program, getter.error().message);
+			return Runtime;
+		}
+		DumpResult result;
+		dump_container(ready, **getter, dest, filters, json, result);
+		return report(std::move(result), dest, json);
 	}
-	if (route->type != GetterSuggestionType::Images) {
-		std::println(stderr, "{}: download currently supports image containers only", program);
+
+	// stdin mode: consume the JSON that `search`/`latest --json` emits — records
+	// carrying {parser, handle} — and dump each via from_serialized. This is what
+	// closes `anip search --json | ... | anip download`.
+	std::string input((std::istreambuf_iterator<char>(std::cin)),
+	                  std::istreambuf_iterator<char>());
+	// Some shells (PowerShell) prepend a UTF-8 BOM when piping to a native stdin;
+	// strip it so the JSON parser sees a clean '['.
+	if (input.starts_with("\xEF\xBB\xBF")) {
+		input.erase(0, 3);
+	}
+	if (input.find_first_not_of(" \t\r\n") == std::string::npos) {
+		std::println(stderr, "{}: download needs a <url>, or JSON records on stdin", program);
+		return Usage;
+	}
+	boost::json::value doc;
+	try {
+		doc = boost::json::parse(input);
+	} catch (const std::exception& e) {
+		std::println(stderr, "{}: could not parse stdin as JSON: {}", program, e.what());
 		return Usage;
 	}
 
-	auto client = std::make_shared<AsyncClient>();
-	RequestorContext ctx(client);
-	RequestorContext ready = ctx.new_with_config(route->parser->make_config(ctx.config()));
-
-	auto root = route->parser->images_getter();
-	auto getter = coro::sync_wait(root->parse_url(ready, std::move(route->url)));
-	if (!getter) {
-		std::println(stderr, "{}: parse failed: {}", program, getter.error().message);
-		return Runtime;
+	DumpResult result;
+	if (doc.is_array()) {
+		for (const auto& v : doc.as_array()) {
+			if (v.is_object()) {
+				dump_serialized(store, ctx, v.as_object(), dest, filters, json, result);
+			}
+		}
+	} else if (doc.is_object()) {
+		dump_serialized(store, ctx, doc.as_object(), dest, filters, json, result);
+	} else {
+		std::println(stderr, "{}: stdin JSON must be an object or array of records", program);
+		return Usage;
 	}
-	return dump_container(ready, **getter, dest, filters, json);
+	return report(std::move(result), dest, json);
 }
 
 int real_main(std::span<const std::string_view> args) {
