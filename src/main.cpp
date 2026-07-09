@@ -3,8 +3,9 @@
  *
  * anip — a command-line interface to libaniparse. Not a downloader: the point is
  * automation over the whole library (search --json | jq | parse --download,
- * cron trackers on latest --json). All verbs (list, support, latest, search,
- * parse) are implemented; download is the remaining planned addition.
+ * cron trackers on latest --json). All verbs are implemented; download handles
+ * image containers by buffering each file (request()->body), with streaming/CBZ
+ * and a serialized-handle input (to close search|download) still to come.
  */
 #include <aniparse/ParserStore.hpp>
 #include <aniparse/Client.hpp>
@@ -17,6 +18,9 @@
 
 #include <charconv>
 #include <cstdint>
+#include <filesystem>
+#include <format>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <print>
@@ -44,6 +48,7 @@ int usage() {
 	    "  latest -p <parser> [--from N] [--limit N] [--sort KEY] [--asc]\n"
 	    "  search -p <parser> -q <query> [--filter k=v ...] [--from N] [--limit N]\n"
 	    "  parse <url>             route a URL to its source and fetch info\n"
+	    "  download <url> [--dest DIR] [--limit N]   save an image container's files\n"
 	    "\n"
 	    "Global:\n"
 	    "  --json   emit machine-readable JSON instead of human text\n"
@@ -635,6 +640,126 @@ int support(std::span<const std::string_view> args, bool json) {
 	return print_latest_support(source, category, s.supported_sorts, s.compatibilities, json);
 }
 
+/// A filename for a downloaded image: the URL's basename (query stripped), or a
+/// synthetic item_<index> when the URL carries none.
+std::string filename_from_url(std::string_view url, pageoff index) {
+	const std::string_view path = url.substr(0, url.find_first_of("?#"));
+	const auto slash = path.find_last_of('/');
+	const std::string_view base = (slash == std::string_view::npos) ? path : path.substr(slash + 1);
+	if (base.empty()) {
+		return "item_" + std::to_string(static_cast<long long>(index));
+	}
+	return std::string(base);
+}
+
+/// Fetch a container's items and write each image to @p dest via request()->body
+/// (whole image buffered — fine for stills; video/huge waits on streaming). The
+/// shared sink so a URL (parse_url) and later a serialized handle (from_serialized)
+/// both funnel here.
+int dump_container(RequestorContext& ctx, ImageContainerGetter& container,
+                   const std::string& dest, GetFilters filters, bool json) {
+	auto items = coro::sync_wait(container.items(ctx, filters));
+	if (!items) {
+		std::println(stderr, "{}: items failed: {}", program, items.error().message);
+		return Runtime;
+	}
+
+	std::error_code ec;
+	std::filesystem::create_directories(dest, ec);
+
+	boost::json::array written;
+	int ok = 0;
+	int failed = 0;
+	for (auto& entry : items->results) {
+		const Image& image = entry.item.image;
+		auto resp = coro::sync_wait(ctx.request(GetRequest{ .url = image.url, .headers = image.headers }));
+		if (!resp || resp->status_code >= 400 || resp->body.empty()) {
+			++failed;
+			std::println(stderr, "{}: item {} failed{}", program, static_cast<long long>(entry.offset),
+			    resp ? std::format(" (http {})", resp->status_code) : std::string{});
+			continue;
+		}
+		const std::filesystem::path out =
+		    std::filesystem::path(dest) / filename_from_url(image.url, entry.offset);
+		std::ofstream file(out, std::ios::binary);
+		if (!file) {
+			++failed;
+			std::println(stderr, "{}: cannot open {}", program, out.string());
+			continue;
+		}
+		file.write(resp->body.data(), static_cast<std::streamsize>(resp->body.size()));
+		++ok;
+		if (json) {
+			written.emplace_back(out.string());
+		} else {
+			std::println("  {} ({} bytes)", out.string(), resp->body.size());
+		}
+	}
+
+	if (json) {
+		boost::json::object o;
+		o["written"] = std::move(written);
+		o["ok"]      = ok;
+		o["failed"]  = failed;
+		std::println("{}", boost::json::serialize(boost::json::value(std::move(o))));
+	} else {
+		std::println("Downloaded {} file(s) to {}{}", ok, dest,
+		    failed > 0 ? std::format(" ({} failed)", failed) : std::string{});
+	}
+	return (ok == 0 && failed > 0) ? Runtime : Ok;
+}
+
+int download(std::span<const std::string_view> args, bool json) {
+	std::optional<std::string_view> url;
+	for (const std::string_view a : args) {
+		if (!a.starts_with('-')) {
+			url = a;
+			break;
+		}
+	}
+	if (!url) {
+		std::println(stderr, "{}: download needs a <url>", program);
+		return Usage;
+	}
+	std::string dest = ".";
+	if (const auto d = flag_value(args, "--dest")) {
+		dest = std::string(*d);
+	}
+	GetFilters filters; // default: every item of the container
+	if (const auto v = flag_value(args, "--limit")) {
+		const auto n = parse_uint(*v);
+		if (!n) {
+			std::println(stderr, "{}: --limit expects a non-negative integer", program);
+			return Usage;
+		}
+		filters.limit = static_cast<std::size_t>(*n);
+	}
+
+	ParserStore store;
+	populate_store(store);
+	std::optional<UrlRoute> route = store.route_url(*url);
+	if (!route) {
+		std::println(stderr, "{}: no source handles '{}'", program, *url);
+		return Runtime;
+	}
+	if (route->type != GetterSuggestionType::Images) {
+		std::println(stderr, "{}: download currently supports image containers only", program);
+		return Usage;
+	}
+
+	auto client = std::make_shared<AsyncClient>();
+	RequestorContext ctx(client);
+	RequestorContext ready = ctx.new_with_config(route->parser->make_config(ctx.config()));
+
+	auto root = route->parser->images_getter();
+	auto getter = coro::sync_wait(root->parse_url(ready, std::move(route->url)));
+	if (!getter) {
+		std::println(stderr, "{}: parse failed: {}", program, getter.error().message);
+		return Runtime;
+	}
+	return dump_container(ready, **getter, dest, filters, json);
+}
+
 int real_main(std::span<const std::string_view> args) {
 	// Split a single global flag (--json) from the verb + its arguments. --help
 	// anywhere shows help and exits 0.
@@ -664,6 +789,7 @@ int real_main(std::span<const std::string_view> args) {
 	if (verb == "latest")  return latest(verb_args, json);
 	if (verb == "search")  return search(verb_args, json);
 	if (verb == "parse")   return parse_verb(verb_args, json);
+	if (verb == "download") return download(verb_args, json);
 
 	std::println(stderr, "{}: unknown command '{}'", program, verb);
 	return usage();
