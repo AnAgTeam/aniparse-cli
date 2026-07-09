@@ -3,8 +3,8 @@
  *
  * anip — a command-line interface to libaniparse. Not a downloader: the point is
  * automation over the whole library (search --json | jq | parse --download,
- * cron trackers on latest --json). `list parsers` and `latest` are implemented
- * end to end; support/search/parse are wired into the dispatch but not yet filled.
+ * cron trackers on latest --json). `list parsers`, `latest` and `parse` are
+ * implemented end to end; support/search are wired in but not yet filled.
  */
 #include <aniparse/ParserStore.hpp>
 #include <aniparse/Client.hpp>
@@ -266,6 +266,101 @@ int latest(std::span<const std::string_view> args, bool json) {
 	return Usage;
 }
 
+/// Print full info for a single parsed container. Templated over the getter so
+/// one body serves manga and images — both infos expose title/description/tags/id.
+template <typename GetterPtr>
+int emit_parsed(RequestorContext& ctx, GetterPtr getter, std::string_view source,
+                std::string_view category, bool json) {
+	auto info = coro::sync_wait(getter->info(ctx));
+	if (!info) {
+		std::println(stderr, "{}: fetch failed: {}", program, info.error().message);
+		return Runtime;
+	}
+
+	if (json) {
+		boost::json::array tags;
+		for (const Tag& t : info->tags) {
+			tags.emplace_back(t.name);
+		}
+		boost::json::object o;
+		o["source"]      = std::string(source);
+		o["category"]    = std::string(category);
+		o["id"]          = static_cast<std::int64_t>(info->id);
+		o["title"]       = info->title;
+		o["description"] = info->description.text;
+		o["tags"]        = std::move(tags);
+		std::println("{}", boost::json::serialize(boost::json::value(std::move(o))));
+		return Ok;
+	}
+
+	std::println("Source:   {} ({})", source, category);
+	std::println("Id:       {}", static_cast<long long>(info->id));
+	std::println("Title:    {}", info->title);
+	if (!info->description.text.empty()) {
+		std::println("Summary:  {}", info->description.text);
+	}
+	if (!info->tags.empty()) {
+		std::vector<std::string_view> names;
+		for (const Tag& t : info->tags) {
+			names.push_back(t.name);
+		}
+		std::println("Tags:     {}", join(names, ", "));
+	}
+	return Ok;
+}
+
+int parse_verb(std::span<const std::string_view> args, bool json) {
+	std::optional<std::string_view> url;
+	for (const std::string_view a : args) {
+		if (!a.starts_with('-')) {
+			url = a;
+			break;
+		}
+	}
+	if (!url) {
+		std::println(stderr, "{}: parse needs a <url>", program);
+		return Usage;
+	}
+
+	ParserStore store;
+	populate_store(store);
+	std::optional<UrlRoute> route = store.route_url(*url);
+	if (!route) {
+		std::println(stderr, "{}: no source handles '{}' (try `{} list parsers`)",
+		    program, *url, program);
+		return Runtime;
+	}
+
+	auto client = std::make_shared<AsyncClient>();
+	RequestorContext ctx(client);
+	RequestorContext ready = ctx.new_with_config(route->parser->make_config(ctx.config()));
+	const std::string source = route->parser->info().name;
+
+	// route->url is consumed by parse_url; keep the root getter in a named local so
+	// it outlives the coroutine that reads from it.
+	if (route->type == GetterSuggestionType::Manga) {
+		auto root = route->parser->mangas_getter();
+		auto getter = coro::sync_wait(root->parse_url(ready, std::move(route->url)));
+		if (!getter) {
+			std::println(stderr, "{}: parse failed: {}", program, getter.error().message);
+			return Runtime;
+		}
+		return emit_parsed(ready, std::move(*getter), source, "manga", json);
+	}
+	if (route->type == GetterSuggestionType::Images) {
+		auto root = route->parser->images_getter();
+		auto getter = coro::sync_wait(root->parse_url(ready, std::move(route->url)));
+		if (!getter) {
+			std::println(stderr, "{}: parse failed: {}", program, getter.error().message);
+			return Runtime;
+		}
+		return emit_parsed(ready, std::move(*getter), source, "images", json);
+	}
+	std::println(stderr, "{}: '{}' routed to {} but its category is not supported yet",
+	    program, *url, source);
+	return Runtime;
+}
+
 int real_main(std::span<const std::string_view> args) {
 	// Split a single global flag (--json) from the verb + its arguments. --help
 	// anywhere shows help and exits 0.
@@ -294,7 +389,7 @@ int real_main(std::span<const std::string_view> args) {
 	if (verb == "support") return not_yet("support");
 	if (verb == "latest")  return latest(verb_args, json);
 	if (verb == "search")  return not_yet("search");
-	if (verb == "parse")   return not_yet("parse");
+	if (verb == "parse")   return parse_verb(verb_args, json);
 
 	std::println(stderr, "{}: unknown command '{}'", program, verb);
 	return usage();
