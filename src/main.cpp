@@ -3,8 +3,8 @@
  *
  * anip — a command-line interface to libaniparse. Not a downloader: the point is
  * automation over the whole library (search --json | jq | parse --download,
- * cron trackers on latest --json). `list parsers`, `latest`, `search` and `parse`
- * are implemented end to end; `support` is wired in but not yet filled.
+ * cron trackers on latest --json). All verbs (list, support, latest, search,
+ * parse) are implemented; download is the remaining planned addition.
  */
 #include <aniparse/ParserStore.hpp>
 #include <aniparse/Client.hpp>
@@ -118,6 +118,8 @@ int list_parsers(bool json) {
 	return Ok;
 }
 
+int list_filters(bool json); // defined below
+
 int list(std::span<const std::string_view> args, bool json) {
 	if (args.empty()) {
 		std::println(stderr, "{}: list needs a subcommand (parsers|filters)", program);
@@ -127,18 +129,10 @@ int list(std::span<const std::string_view> args, bool json) {
 		return list_parsers(json);
 	}
 	if (args[0] == "filters") {
-		std::println(stderr, "{}: 'list filters' is not implemented yet", program);
-		return Usage;
+		return list_filters(json);
 	}
 	std::println(stderr, "{}: unknown list subcommand '{}'", program, args[0]);
 	return usage();
-}
-
-/// Placeholder for the networked verbs: dispatch is real, the fetch is pending.
-int not_yet(std::string_view verb) {
-	std::println(stderr, "{}: '{}' is not implemented yet (networked verbs are next)",
-	    program, verb);
-	return Usage;
 }
 
 /// The value token following @p name (e.g. "-p"), or nullopt if @p name is absent
@@ -419,6 +413,228 @@ int parse_verb(std::span<const std::string_view> args, bool json) {
 	return Runtime;
 }
 
+int list_filters(bool json) {
+	using namespace search_keys;
+	struct Key { std::string_view key; std::string_view about; };
+	// The canonical filter keys the library exposes (values a source may accept and
+	// that --filter will speak). episodes is an alias of pages; both map to "icount".
+	static constexpr Key keys[] = {
+	    { title,           "title text" },
+	    { series,          "series / franchise" },
+	    { tag,             "a content tag" },
+	    { pages,           "chapter/page count (alias: episodes)" },
+	    { status,          "publication status" },
+	    { rating,          "content rating" },
+	    { year,            "release year" },
+	    { release_time,    "release date" },
+	    { upload_time,     "upload date" },
+	    { age_restriction, "minimum age" },
+	    { artist,          "artist" },
+	    { character,       "character" },
+	    { group,           "scanlation / translation group" },
+	    { type,            "media type" },
+	    { language,        "language" },
+	};
+
+	if (json) {
+		boost::json::array arr;
+		for (const Key& k : keys) {
+			boost::json::object o;
+			o["key"]   = std::string(k.key);
+			o["about"] = std::string(k.about);
+			arr.push_back(std::move(o));
+		}
+		std::println("{}", boost::json::serialize(boost::json::value(std::move(arr))));
+		return Ok;
+	}
+
+	std::println("Canonical search-filter keys (the library vocabulary):");
+	for (const Key& k : keys) {
+		std::println("  {:<10} {}", k.key, k.about);
+	}
+	std::println("\nWhich a source actually accepts: {} support search -p <parser>", program);
+	return Ok;
+}
+
+std::string sort_directions(const SortDescriptor& d) {
+	std::string out;
+	if (d.ascending) {
+		out += "asc";
+	}
+	if (d.descending) {
+		if (!out.empty()) {
+			out += "/";
+		}
+		out += "desc";
+	}
+	return out.empty() ? "(none)" : out;
+}
+
+int print_search_support(std::string_view source, std::string_view category,
+                         const SearchCompatibilities& sc, bool json) {
+	if (json) {
+		boost::json::array filters;
+		for (const auto& [key, value] : sc.supported_filters) {
+			filters.emplace_back(key);
+		}
+		boost::json::array sorts;
+		for (const auto& [key, dir] : sc.supported_sorts) {
+			boost::json::object o;
+			o["key"]  = key;
+			o["asc"]  = dir.ascending;
+			o["desc"] = dir.descending;
+			sorts.push_back(std::move(o));
+		}
+		boost::json::array flags;
+		for (const std::string_view f : capability_labels(sc.compatibilities)) {
+			flags.emplace_back(f);
+		}
+		boost::json::array kinds;
+		for (const std::string& k : sc.supported_suggestion_kinds) {
+			kinds.emplace_back(k);
+		}
+		boost::json::object o;
+		o["source"]           = std::string(source);
+		o["category"]         = std::string(category);
+		o["filters"]          = std::move(filters);
+		o["sorts"]            = std::move(sorts);
+		o["flags"]            = std::move(flags);
+		o["suggestion_kinds"] = std::move(kinds);
+		std::println("{}", boost::json::serialize(boost::json::value(std::move(o))));
+		return Ok;
+	}
+
+	std::println("Source:  {} ({}) — search", source, category);
+	if (sc.supported_filters.empty()) {
+		std::println("Filters: (free-text query only)");
+	} else {
+		std::vector<std::string_view> keys;
+		for (const auto& [key, value] : sc.supported_filters) {
+			keys.push_back(key);
+		}
+		std::println("Filters: {}", join(keys, ", "));
+	}
+	if (sc.supported_sorts.empty()) {
+		std::println("Sorts:   (source default only)");
+	} else {
+		std::println("Sorts:");
+		for (const auto& [key, dir] : sc.supported_sorts) {
+			std::println("  {:<14} [{}]", key, sort_directions(dir));
+		}
+	}
+	std::println("Flags:   {}", join(capability_labels(sc.compatibilities), ", "));
+	if (!sc.supported_suggestion_kinds.empty()) {
+		std::vector<std::string_view> kinds(sc.supported_suggestion_kinds.begin(),
+		                                    sc.supported_suggestion_kinds.end());
+		std::println("Suggest: {}", join(kinds, ", "));
+	}
+	return Ok;
+}
+
+int print_latest_support(std::string_view source, std::string_view category,
+                         const SupportedSorts& sorts, const CompatibilitiesFlags& flags,
+                         bool json) {
+	if (json) {
+		boost::json::array sortarr;
+		for (const auto& [key, dir] : sorts) {
+			boost::json::object o;
+			o["key"]  = key;
+			o["asc"]  = dir.ascending;
+			o["desc"] = dir.descending;
+			sortarr.push_back(std::move(o));
+		}
+		boost::json::array flagarr;
+		for (const std::string_view f : capability_labels(flags)) {
+			flagarr.emplace_back(f);
+		}
+		boost::json::object o;
+		o["source"]   = std::string(source);
+		o["category"] = std::string(category);
+		o["sorts"]    = std::move(sortarr);
+		o["flags"]    = std::move(flagarr);
+		std::println("{}", boost::json::serialize(boost::json::value(std::move(o))));
+		return Ok;
+	}
+
+	std::println("Source:  {} ({}) — latest", source, category);
+	if (sorts.empty()) {
+		std::println("Sorts:   (source default only)");
+	} else {
+		std::println("Sorts:");
+		for (const auto& [key, dir] : sorts) {
+			std::println("  {:<14} [{}]", key, sort_directions(dir));
+		}
+	}
+	std::println("Flags:   {}", join(capability_labels(flags), ", "));
+	return Ok;
+}
+
+/// sync_wait a root getter's search_support and unwrap it; nullopt (after
+/// printing) on error. Templated so one body serves manga and images roots.
+template <typename RootGetterPtr>
+std::optional<SearchCompatibilities> fetch_search_support(RequestorContext& ctx, RootGetterPtr root) {
+	auto r = coro::sync_wait(root->search_support(ctx));
+	if (!r) {
+		std::println(stderr, "{}: search_support failed: {}", program, r.error().message);
+		return std::nullopt;
+	}
+	return std::move(*r);
+}
+
+int support(std::span<const std::string_view> args, bool json) {
+	if (args.empty() || (args[0] != "latest" && args[0] != "search")) {
+		std::println(stderr, "{}: support needs a subcommand (latest|search)", program);
+		return usage();
+	}
+	const std::string_view which = args[0];
+	const std::optional<std::string_view> pkey = flag_value(args, "-p");
+	if (!pkey) {
+		std::println(stderr, "{}: support needs -p <parser>", program);
+		return Usage;
+	}
+
+	ParserStore store;
+	populate_store(store);
+	const std::shared_ptr<Parser> parser = store.find_by_key(*pkey);
+	if (!parser) {
+		std::println(stderr, "{}: no parser '{}' (try `{} list parsers`)", program, *pkey, program);
+		return Usage;
+	}
+
+	auto client = std::make_shared<AsyncClient>();
+	RequestorContext ctx(client);
+	RequestorContext ready = ctx.new_with_config(parser->make_config(ctx.config()));
+
+	using namespace compatibilities_flags;
+	const CompatibilitiesFlags pflags = parser->compatibilities().flags;
+	const bool is_manga  = pflags.has(supports_manga_store);
+	const bool is_images = pflags.has(supports_images_store) || pflags.has(supports_images_search);
+	if (!is_manga && !is_images) {
+		std::println(stderr, "{}: parser '{}' has no browsable category", program, *pkey);
+		return Usage;
+	}
+	const std::string source        = parser->info().name;
+	const std::string_view category = is_manga ? "manga" : "images";
+
+	if (which == "search") {
+		std::optional<SearchCompatibilities> sc =
+		    is_manga ? fetch_search_support(ready, parser->mangas_getter())
+		             : fetch_search_support(ready, parser->images_getter());
+		if (!sc) {
+			return Runtime;
+		}
+		return print_search_support(source, category, *sc, json);
+	}
+
+	// latest — synchronous, no network.
+	if (is_manga) {
+		const MangaGetterRootCompatibilities s = parser->mangas_getter()->latest_support();
+		return print_latest_support(source, category, s.supported_sorts, s.compatibilities, json);
+	}
+	const ImagesGetterRootCompatibilities s = parser->images_getter()->latest_support();
+	return print_latest_support(source, category, s.supported_sorts, s.compatibilities, json);
+}
+
 int real_main(std::span<const std::string_view> args) {
 	// Split a single global flag (--json) from the verb + its arguments. --help
 	// anywhere shows help and exits 0.
@@ -444,7 +660,7 @@ int real_main(std::span<const std::string_view> args) {
 	const std::span<const std::string_view> verb_args(rest.begin() + 1, rest.end());
 
 	if (verb == "list")    return list(verb_args, json);
-	if (verb == "support") return not_yet("support");
+	if (verb == "support") return support(verb_args, json);
 	if (verb == "latest")  return latest(verb_args, json);
 	if (verb == "search")  return search(verb_args, json);
 	if (verb == "parse")   return parse_verb(verb_args, json);
