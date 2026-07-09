@@ -3,8 +3,8 @@
  *
  * anip — a command-line interface to libaniparse. Not a downloader: the point is
  * automation over the whole library (search --json | jq | parse --download,
- * cron trackers on latest --json). `list parsers`, `latest` and `parse` are
- * implemented end to end; support/search are wired in but not yet filled.
+ * cron trackers on latest --json). `list parsers`, `latest`, `search` and `parse`
+ * are implemented end to end; `support` is wired in but not yet filled.
  */
 #include <aniparse/ParserStore.hpp>
 #include <aniparse/Client.hpp>
@@ -173,14 +173,43 @@ std::optional<long long> parse_uint(std::string_view s) {
 	return value;
 }
 
-/// Fetch and print a page of latest containers. Templated over the root getter so
-/// one body serves both manga and images: their latest() returns the same
-/// PageResults<unique_ptr<...>> shape and both leaf infos expose .title.
-template <typename RootGetterPtr>
-int emit_latest_page(RequestorContext& ctx, RootGetterPtr root, GetFilters filters, bool json) {
-	auto page = coro::sync_wait(root->latest(ctx, filters));
+/// Parse the paging/sort flags shared by latest and search (--from/--limit/--sort
+/// [--asc]). nullopt (after printing) on a malformed number; --limit defaults to
+/// 20 to bound the per-item preview fetches.
+std::optional<GetFilters> parse_filters(std::span<const std::string_view> args) {
+	GetFilters filters;
+	if (const auto v = flag_value(args, "--from")) {
+		const auto n = parse_uint(*v);
+		if (!n) {
+			std::println(stderr, "{}: --from expects a non-negative integer", program);
+			return std::nullopt;
+		}
+		filters.from = static_cast<pageoff>(*n);
+	}
+	if (const auto v = flag_value(args, "--limit")) {
+		const auto n = parse_uint(*v);
+		if (!n) {
+			std::println(stderr, "{}: --limit expects a non-negative integer", program);
+			return std::nullopt;
+		}
+		filters.limit = static_cast<std::size_t>(*n);
+	} else {
+		filters.limit = 20;
+	}
+	if (const auto v = flag_value(args, "--sort")) {
+		filters.sort = SortOrder{ .key = std::string(*v), .ascending = has_flag(args, "--asc") };
+	}
+	return filters;
+}
+
+/// Print a fetched page of container getters (shared by latest and search).
+/// Templated over the awaited result so one body serves both manga and images:
+/// latest()/search() return the same PageResults<unique_ptr<...>> and both leaf
+/// infos expose .title (fetched per item via preview_info).
+template <typename PageResult>
+int emit_page(RequestorContext& ctx, PageResult page, bool json) {
 	if (!page) {
-		std::println(stderr, "{}: latest failed: {}", program, page.error().message);
+		std::println(stderr, "{}: request failed: {}", program, page.error().message);
 		return Runtime;
 	}
 
@@ -217,29 +246,9 @@ int latest(std::span<const std::string_view> args, bool json) {
 		return Usage;
 	}
 
-	GetFilters filters;
-	if (const auto v = flag_value(args, "--from")) {
-		const auto n = parse_uint(*v);
-		if (!n) {
-			std::println(stderr, "{}: --from expects a non-negative integer", program);
-			return Usage;
-		}
-		filters.from = static_cast<pageoff>(*n);
-	}
-	if (const auto v = flag_value(args, "--limit")) {
-		const auto n = parse_uint(*v);
-		if (!n) {
-			std::println(stderr, "{}: --limit expects a non-negative integer", program);
-			return Usage;
-		}
-		filters.limit = static_cast<std::size_t>(*n);
-	} else {
-		// A listing default: bound the per-item preview fetches rather than pulling
-		// the source's whole default feed.
-		filters.limit = 20;
-	}
-	if (const auto v = flag_value(args, "--sort")) {
-		filters.sort = SortOrder{ .key = std::string(*v), .ascending = has_flag(args, "--asc") };
+	const std::optional<GetFilters> filters = parse_filters(args);
+	if (!filters) {
+		return Usage;
 	}
 
 	ParserStore store;
@@ -257,12 +266,61 @@ int latest(std::span<const std::string_view> args, bool json) {
 	using namespace compatibilities_flags;
 	const CompatibilitiesFlags flags = parser->compatibilities().flags;
 	if (flags.has(supports_manga_store)) {
-		return emit_latest_page(ready, parser->mangas_getter(), filters, json);
+		auto root = parser->mangas_getter();
+		return emit_page(ready, coro::sync_wait(root->latest(ready, *filters)), json);
 	}
 	if (flags.has(supports_images_store) || flags.has(supports_images_search)) {
-		return emit_latest_page(ready, parser->images_getter(), filters, json);
+		auto root = parser->images_getter();
+		return emit_page(ready, coro::sync_wait(root->latest(ready, *filters)), json);
 	}
 	std::println(stderr, "{}: parser '{}' has no browsable latest feed", program, *pkey);
+	return Usage;
+}
+
+int search(std::span<const std::string_view> args, bool json) {
+	const std::optional<std::string_view> pkey = flag_value(args, "-p");
+	if (!pkey) {
+		std::println(stderr, "{}: search needs -p <parser>", program);
+		return Usage;
+	}
+	const std::optional<std::string_view> query = flag_value(args, "-q");
+	if (!query) {
+		std::println(stderr, "{}: search needs -q <query>", program);
+		return Usage;
+	}
+	const std::optional<GetFilters> filters = parse_filters(args);
+	if (!filters) {
+		return Usage;
+	}
+
+	ParserStore store;
+	populate_store(store);
+	const std::shared_ptr<Parser> parser = store.find_by_key(*pkey);
+	if (!parser) {
+		std::println(stderr, "{}: no parser '{}' (try `{} list parsers`)", program, *pkey, program);
+		return Usage;
+	}
+
+	auto client = std::make_shared<AsyncClient>();
+	RequestorContext ctx(client);
+	RequestorContext ready = ctx.new_with_config(parser->make_config(ctx.config()));
+
+	// Free-text query only for now; structured --filter k=v needs the SearchItems
+	// (SearchItemVariant) builder and is deferred.
+	SearchRequestQuery request;
+	request.query = std::string(*query);
+
+	using namespace compatibilities_flags;
+	const CompatibilitiesFlags flags = parser->compatibilities().flags;
+	if (flags.has(supports_manga_store)) {
+		auto root = parser->mangas_getter();
+		return emit_page(ready, coro::sync_wait(root->search(ready, request, *filters)), json);
+	}
+	if (flags.has(supports_images_search)) {
+		auto root = parser->images_getter();
+		return emit_page(ready, coro::sync_wait(root->search(ready, request, *filters)), json);
+	}
+	std::println(stderr, "{}: parser '{}' does not support search", program, *pkey);
 	return Usage;
 }
 
@@ -388,7 +446,7 @@ int real_main(std::span<const std::string_view> args) {
 	if (verb == "list")    return list(verb_args, json);
 	if (verb == "support") return not_yet("support");
 	if (verb == "latest")  return latest(verb_args, json);
-	if (verb == "search")  return not_yet("search");
+	if (verb == "search")  return search(verb_args, json);
 	if (verb == "parse")   return parse_verb(verb_args, json);
 
 	std::println(stderr, "{}: unknown command '{}'", program, verb);
