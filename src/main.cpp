@@ -3,16 +3,22 @@
  *
  * anip — a command-line interface to libaniparse. Not a downloader: the point is
  * automation over the whole library (search --json | jq | parse --download,
- * cron trackers on latest --json). This first slice implements `list parsers`
- * end to end; the networked verbs are wired into the dispatch but not yet filled.
+ * cron trackers on latest --json). `list parsers` and `latest` are implemented
+ * end to end; support/search/parse are wired into the dispatch but not yet filled.
  */
 #include <aniparse/ParserStore.hpp>
+#include <aniparse/Client.hpp>
 #include <aniparse/parsers/DefaultParsers.hpp>
 
 #include "anip_extensions.hpp" // generated: register_extensions (seam A)
 
 #include <boost/json.hpp>
+#include <coro/sync_wait.hpp>
 
+#include <charconv>
+#include <cstdint>
+#include <memory>
+#include <optional>
 #include <print>
 #include <span>
 #include <string>
@@ -35,7 +41,7 @@ int usage() {
 	    "  list parsers            list the available sources\n"
 	    "  list filters            list the library's search-filter vocabulary\n"
 	    "  support (latest|search) -p <parser>   show what a source supports\n"
-	    "  latest -p <parser> [--from N] [--limit N] [--sort S]\n"
+	    "  latest -p <parser> [--from N] [--limit N] [--sort KEY] [--asc]\n"
 	    "  search -p <parser> -q <query> [--filter k=v ...] [--from N] [--limit N]\n"
 	    "  parse <url>             route a URL to its source and fetch info\n"
 	    "\n"
@@ -135,6 +141,131 @@ int not_yet(std::string_view verb) {
 	return Usage;
 }
 
+/// The value token following @p name (e.g. "-p"), or nullopt if @p name is absent
+/// or has no following token.
+std::optional<std::string_view> flag_value(std::span<const std::string_view> args,
+                                           std::string_view name) {
+	for (std::size_t i = 0; i + 1 < args.size(); ++i) {
+		if (args[i] == name) {
+			return args[i + 1];
+		}
+	}
+	return std::nullopt;
+}
+
+bool has_flag(std::span<const std::string_view> args, std::string_view name) {
+	for (const std::string_view a : args) {
+		if (a == name) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/// Parse a non-negative integer that consumes the whole token; nullopt otherwise.
+std::optional<long long> parse_uint(std::string_view s) {
+	long long value = 0;
+	const auto* const end = s.data() + s.size();
+	const auto [ptr, ec] = std::from_chars(s.data(), end, value);
+	if (ec != std::errc{} || ptr != end || value < 0) {
+		return std::nullopt;
+	}
+	return value;
+}
+
+/// Fetch and print a page of latest containers. Templated over the root getter so
+/// one body serves both manga and images: their latest() returns the same
+/// PageResults<unique_ptr<...>> shape and both leaf infos expose .title.
+template <typename RootGetterPtr>
+int emit_latest_page(RequestorContext& ctx, RootGetterPtr root, GetFilters filters, bool json) {
+	auto page = coro::sync_wait(root->latest(ctx, filters));
+	if (!page) {
+		std::println(stderr, "{}: latest failed: {}", program, page.error().message);
+		return Runtime;
+	}
+
+	boost::json::array arr;
+	int skipped = 0;
+	for (auto& entry : page->results) {
+		auto info = coro::sync_wait(entry.item->preview_info(ctx));
+		if (!info) {
+			++skipped; // a per-item preview fetch failed; keep going, report the count
+			continue;
+		}
+		if (json) {
+			boost::json::object o;
+			o["offset"] = static_cast<std::int64_t>(entry.offset);
+			o["title"]  = info->title;
+			arr.push_back(std::move(o));
+		} else {
+			std::println("{:>4}  {}", static_cast<long long>(entry.offset), info->title);
+		}
+	}
+
+	if (json) {
+		std::println("{}", boost::json::serialize(boost::json::value(std::move(arr))));
+	} else if (skipped > 0) {
+		std::println(stderr, "{}: {} item(s) skipped (preview fetch failed)", program, skipped);
+	}
+	return Ok;
+}
+
+int latest(std::span<const std::string_view> args, bool json) {
+	const std::optional<std::string_view> pkey = flag_value(args, "-p");
+	if (!pkey) {
+		std::println(stderr, "{}: latest needs -p <parser>", program);
+		return Usage;
+	}
+
+	GetFilters filters;
+	if (const auto v = flag_value(args, "--from")) {
+		const auto n = parse_uint(*v);
+		if (!n) {
+			std::println(stderr, "{}: --from expects a non-negative integer", program);
+			return Usage;
+		}
+		filters.from = static_cast<pageoff>(*n);
+	}
+	if (const auto v = flag_value(args, "--limit")) {
+		const auto n = parse_uint(*v);
+		if (!n) {
+			std::println(stderr, "{}: --limit expects a non-negative integer", program);
+			return Usage;
+		}
+		filters.limit = static_cast<std::size_t>(*n);
+	} else {
+		// A listing default: bound the per-item preview fetches rather than pulling
+		// the source's whole default feed.
+		filters.limit = 20;
+	}
+	if (const auto v = flag_value(args, "--sort")) {
+		filters.sort = SortOrder{ .key = std::string(*v), .ascending = has_flag(args, "--asc") };
+	}
+
+	ParserStore store;
+	populate_store(store);
+	const std::shared_ptr<Parser> parser = store.find_by_key(*pkey);
+	if (!parser) {
+		std::println(stderr, "{}: no parser '{}' (try `{} list parsers`)", program, *pkey, program);
+		return Usage;
+	}
+
+	auto client = std::make_shared<AsyncClient>();
+	RequestorContext ctx(client);
+	RequestorContext ready = ctx.new_with_config(parser->make_config(ctx.config()));
+
+	using namespace compatibilities_flags;
+	const CompatibilitiesFlags flags = parser->compatibilities().flags;
+	if (flags.has(supports_manga_store)) {
+		return emit_latest_page(ready, parser->mangas_getter(), filters, json);
+	}
+	if (flags.has(supports_images_store) || flags.has(supports_images_search)) {
+		return emit_latest_page(ready, parser->images_getter(), filters, json);
+	}
+	std::println(stderr, "{}: parser '{}' has no browsable latest feed", program, *pkey);
+	return Usage;
+}
+
 int real_main(std::span<const std::string_view> args) {
 	// Split a single global flag (--json) from the verb + its arguments. --help
 	// anywhere shows help and exits 0.
@@ -161,7 +292,7 @@ int real_main(std::span<const std::string_view> args) {
 
 	if (verb == "list")    return list(verb_args, json);
 	if (verb == "support") return not_yet("support");
-	if (verb == "latest")  return not_yet("latest");
+	if (verb == "latest")  return latest(verb_args, json);
 	if (verb == "search")  return not_yet("search");
 	if (verb == "parse")   return not_yet("parse");
 
