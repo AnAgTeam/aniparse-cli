@@ -10,14 +10,19 @@
 #include <aniparse/ParserStore.hpp>
 #include <aniparse/Client.hpp>
 #include <aniparse/parsers/DefaultParsers.hpp>
+#include <aniparse/net/CancellingTask.hpp> // asyncnet::NetworkTask (backend-neutral)
 
 #include "anip_extensions.hpp" // generated: register_extensions (seam A)
 
 #include <boost/json.hpp>
 #include <coro/sync_wait.hpp>
+#include <coro/when_all.hpp>
 
+#include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <filesystem>
 #include <format>
@@ -28,6 +33,7 @@
 #include <optional>
 #include <print>
 #include <span>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -40,7 +46,34 @@ constexpr std::string_view program = "anip";
 
 // Diagnostic: sleep this long before each image fetch to probe source rate limits
 // (some CDNs 403 a burst of page requests). 0 = off; set via download's --delay <ms>.
+// Neutralized when --jobs > 1 (blocking sleep would stall the requestor thread).
 unsigned g_delay_ms = 0;
+
+// Set for the duration of a download so Ctrl-C (SIGINT) requests cancellation of
+// every in-flight fetch — the shared stop_source reaches each request — instead of
+// hard-killing mid-write. request_stop is thread-safe; on Windows the handler runs
+// on its own thread, so touching the atomic pointer from there is fine.
+std::atomic<std::stop_source*> g_active_stop{ nullptr };
+void on_interrupt(int) {
+	if (std::stop_source* stop = g_active_stop.load()) {
+		stop->request_stop();
+	}
+}
+
+/// Installs on_interrupt for SIGINT while alive, pointing it at @p stop; restores
+/// the default handler on scope exit (download has many return paths).
+struct SignalGuard {
+	explicit SignalGuard(std::stop_source& stop) {
+		g_active_stop.store(&stop);
+		std::signal(SIGINT, on_interrupt);
+	}
+	~SignalGuard() {
+		std::signal(SIGINT, SIG_DFL);
+		g_active_stop.store(nullptr);
+	}
+	SignalGuard(const SignalGuard&) = delete;
+	SignalGuard& operator=(const SignalGuard&) = delete;
+};
 
 // 0 ok, 1 runtime error, 2 usage/validation error. --help exits 0.
 enum ExitCode : int { Ok = 0, Runtime = 1, Usage = 2 };
@@ -56,7 +89,7 @@ int usage() {
 	    "  latest -p <parser> [--from N] [--limit N] [--sort KEY] [--asc]\n"
 	    "  search -p <parser> -q <query> [--filter k=v ...] [--from N] [--limit N]\n"
 	    "  parse <url>             route a URL to its source and fetch info\n"
-	    "  download [<url>] [--dest DIR] [--limit N] [--chapters 1-4,8] [--delay MS]  save files\n"
+	    "  download [<url>] [--dest DIR] [--limit N] [--chapters 1-4,8] [--jobs N] [--delay MS]  save files\n"
 	    "                          (image container, or manga chapters->pages;\n"
 	    "                           no <url>: read search/latest --json records from stdin)\n"
 	    "\n"
@@ -702,27 +735,31 @@ struct DumpResult {
 	boost::json::array written;
 };
 
-/// Fetch one image via request()->body and write it into @p dir. The shared leaf
-/// of every download path (image container and manga page); whole image buffered
-/// — fine for stills, video/huge waits on streaming.
-void write_image(RequestorContext& ctx, const Image& image, const std::filesystem::path& dir,
-                 pageoff index, bool json, DumpResult& acc) {
+/// Fetch one image and write it into @p dir. A NetworkTask (not a plain function)
+/// so it composes under for_each_concurrent: co_awaited inside a worker it inherits
+/// the worker's stop_source, so a cancel reaches the in-flight request. The shared
+/// leaf of every download path; whole image buffered — fine for stills, video/huge
+/// waits on streaming. Resumes on the requestor thread, so the counter/output writes
+/// below are serialized with every other worker (one requestor thread) — no locks.
+asyncnet::NetworkTask<void> fetch_and_write(RequestorContext& ctx, Image image,
+                                            std::filesystem::path dir, pageoff index,
+                                            bool json, DumpResult& acc) {
 	if (g_delay_ms != 0) {
 		std::this_thread::sleep_for(std::chrono::milliseconds(g_delay_ms));
 	}
-	auto resp = coro::sync_wait(ctx.request(GetRequest{ .url = image.url, .headers = image.headers }));
+	auto resp = co_await ctx.request(GetRequest{ .url = image.url, .headers = image.headers });
 	if (!resp || resp->status_code >= 400 || resp->body.empty()) {
 		++acc.failed;
 		std::println(stderr, "{}: item {} failed{}", program, static_cast<long long>(index),
 		    resp ? std::format(" (http {})", resp->status_code) : std::string{});
-		return;
+		co_return;
 	}
 	const std::filesystem::path out = dir / utf8_path(filename_from_url(image.url, index));
 	std::ofstream file(out, std::ios::binary);
 	if (!file) {
 		++acc.failed;
 		std::println(stderr, "{}: cannot open {}", program, path_utf8(out));
-		return;
+		co_return;
 	}
 	file.write(resp->body.data(), static_cast<std::streamsize>(resp->body.size()));
 	++acc.ok;
@@ -731,6 +768,49 @@ void write_image(RequestorContext& ctx, const Image& image, const std::filesyste
 	} else {
 		std::println("  {} ({} bytes)", path_utf8(out), resp->body.size());
 	}
+}
+
+/// One worker: pull the next index off the shared cursor and run make_task(i) for it
+/// until the range is drained or a stop is requested (stops starting new items; an
+/// in-flight one is cancelled via the stop_source wired in by for_each_concurrent).
+template<typename MakeTask>
+asyncnet::NetworkTask<void> download_worker(std::shared_ptr<std::atomic<std::size_t>> cursor,
+                                            std::size_t count, std::stop_token stop,
+                                            MakeTask make_task) {
+	for (std::size_t i = cursor->fetch_add(1); i < count; i = cursor->fetch_add(1)) {
+		if (stop.stop_requested()) {
+			break;
+		}
+		co_await make_task(i);
+	}
+}
+
+/// Run make_task(i) for i in [0, count) with at most @p jobs in flight, all sharing
+/// @p stop, and barrier-join. This is asyncnet::gather(stop, ...) inlined for a
+/// runtime-sized set: wire the shared stop into each worker (update_stop_source, so a
+/// cancel reaches its request) then coro::when_all them. A shared atomic cursor bounds
+/// live coroutine frames to `jobs` (not `count`) — matters for thousand-page manga.
+template<typename MakeTask>
+asyncnet::NetworkTask<void> for_each_concurrent(std::stop_source stop, std::size_t count,
+                                                unsigned jobs, MakeTask make_task) {
+	if (count == 0) {
+		co_return;
+	}
+	// Clamp width to [1, count] without std::min/max (windows.h defines min/max macros).
+	unsigned width = jobs < 1u ? 1u : jobs;
+	if (static_cast<std::size_t>(width) > count) {
+		width = static_cast<unsigned>(count);
+	}
+	auto cursor = std::make_shared<std::atomic<std::size_t>>(0);
+	std::vector<asyncnet::NetworkTask<void>> workers;
+	workers.reserve(width);
+	for (unsigned w = 0; w < width; ++w) {
+		workers.push_back(download_worker(cursor, count, stop.get_token(), make_task));
+	}
+	for (auto& worker : workers) {
+		worker.update_stop_source(stop); // so request_stop cancels the request, not just the loop
+	}
+	co_await coro::when_all(std::move(workers));
 }
 
 /// Replace characters a path segment can't hold on Windows/POSIX with '_'.
@@ -805,9 +885,11 @@ std::optional<std::vector<std::size_t>> parse_ranges(std::string_view spec, std:
 	return out;
 }
 
-/// Fetch an image container's items and write each into @p dest.
+/// Fetch an image container's items and write each into @p dest, up to @p jobs at a
+/// time (all cancellable via @p stop).
 void dump_container(RequestorContext& ctx, ImageContainerGetter& container,
-                    const std::string& dest, GetFilters filters, bool json, DumpResult& acc) {
+                    const std::string& dest, GetFilters filters, bool json, DumpResult& acc,
+                    const std::stop_source& stop, unsigned jobs) {
 	auto items = coro::sync_wait(container.items(ctx, filters));
 	if (!items) {
 		std::println(stderr, "{}: items failed: {}", program, items.error().message);
@@ -816,15 +898,19 @@ void dump_container(RequestorContext& ctx, ImageContainerGetter& container,
 	}
 	std::error_code ec;
 	std::filesystem::create_directories(dest, ec);
-	for (auto& entry : items->results) {
-		write_image(ctx, entry.item.image, dest, entry.offset, json, acc);
-	}
+	auto& entries = items->results;
+	const std::filesystem::path dest_path(dest); // CLI arg (ANSI on Windows) — path(dest) is correct
+	auto make_task = [&ctx, &acc, dest_path, json, &entries](std::size_t i) {
+		return fetch_and_write(ctx, entries[i].item.image, dest_path, entries[i].offset, json, acc);
+	};
+	coro::sync_wait(for_each_concurrent(stop, entries.size(), jobs, make_task));
 }
 
 /// Fetch a manga's chapters (those selected by @p chapters_spec) and write each
 /// chapter's pages into a <dest>/<chapter> subdirectory.
 void dump_manga(RequestorContext& ctx, MangaGetter& manga, const std::string& dest,
-                std::string_view chapters_spec, bool json, DumpResult& acc) {
+                std::string_view chapters_spec, bool json, DumpResult& acc,
+                const std::stop_source& stop, unsigned jobs) {
 	auto chapters = coro::sync_wait(manga.chapters_info(ctx, GetFilters{}));
 	if (!chapters) {
 		std::println(stderr, "{}: chapters failed: {}", program, chapters.error().message);
@@ -839,6 +925,9 @@ void dump_manga(RequestorContext& ctx, MangaGetter& manga, const std::string& de
 	}
 
 	for (const std::size_t idx : *selected) {
+		if (stop.stop_requested()) { // Ctrl-C between chapters: stop before the next fetch
+			break;
+		}
 		const MangaChapterInfo& ch = list[idx].item;
 		const std::filesystem::path dir = std::filesystem::path(dest) / utf8_path(chapter_dirname(ch, idx));
 		std::error_code ec;
@@ -851,11 +940,15 @@ void dump_manga(RequestorContext& ctx, MangaGetter& manga, const std::string& de
 			++acc.failed;
 			continue;
 		}
+		auto& page_list = pages->results;
 		std::println("Chapter {} ({} pages)", ch.number.empty() ? std::to_string(idx + 1) : ch.number,
-		    pages->results.size());
-		for (auto& page : pages->results) {
-			write_image(ctx, page.item.image, dir, page.offset, json, acc);
-		}
+		    page_list.size());
+		// Pages fan out (bounded by jobs); chapters stay sequential so their headers
+		// and per-chapter dirs don't interleave.
+		auto make_task = [&ctx, &acc, dir, json, &page_list](std::size_t i) {
+			return fetch_and_write(ctx, page_list[i].item.image, dir, page_list[i].offset, json, acc);
+		};
+		coro::sync_wait(for_each_concurrent(stop, page_list.size(), jobs, make_task));
 	}
 }
 
@@ -877,7 +970,7 @@ int report(DumpResult result, const std::string& dest, bool json) {
 /// search/latest --json) and dump it into @p acc via from_serialized.
 void dump_serialized(ParserStore& store, RequestorContext& ctx, const boost::json::object& record,
                      const std::string& dest, GetFilters filters, std::string_view chapters_spec,
-                     bool json, DumpResult& acc) {
+                     bool json, DumpResult& acc, const std::stop_source& stop, unsigned jobs) {
 	const auto* parser_field = record.if_contains("parser");
 	const auto* handle_field = record.if_contains("handle");
 	if (!parser_field || !parser_field->is_string() || !handle_field || !handle_field->is_object()) {
@@ -924,7 +1017,7 @@ void dump_serialized(ParserStore& store, RequestorContext& ctx, const boost::jso
 			++acc.failed;
 			return;
 		}
-		dump_container(ready, **getter, dest, filters, json, acc);
+		dump_container(ready, **getter, dest, filters, json, acc, stop, jobs);
 	} else {
 		auto root = parser->mangas_getter();
 		auto getter = coro::sync_wait(root->from_serialized(std::move(data)));
@@ -933,7 +1026,7 @@ void dump_serialized(ParserStore& store, RequestorContext& ctx, const boost::jso
 			++acc.failed;
 			return;
 		}
-		dump_manga(ready, **getter, dest, chapters_spec, json, acc);
+		dump_manga(ready, **getter, dest, chapters_spec, json, acc, stop, jobs);
 	}
 }
 
@@ -943,7 +1036,7 @@ int download(std::span<const std::string_view> args, bool json) {
 	std::optional<std::string_view> url;
 	for (std::size_t i = 0; i < args.size(); ++i) {
 		const std::string_view a = args[i];
-		if (a == "--dest" || a == "--limit" || a == "--chapters" || a == "--delay") {
+		if (a == "--dest" || a == "--limit" || a == "--chapters" || a == "--delay" || a == "--jobs") {
 			++i; // consume the flag's value
 			continue;
 		}
@@ -978,6 +1071,25 @@ int download(std::span<const std::string_view> args, bool json) {
 		}
 		g_delay_ms = static_cast<unsigned>(*n);
 	}
+	unsigned jobs = 1; // concurrent image fetches; 1 = sequential
+	if (const auto j = flag_value(args, "--jobs")) {
+		const auto n = parse_uint(*j);
+		if (!n || *n < 1) {
+			std::println(stderr, "{}: --jobs expects a positive integer", program);
+			return Usage;
+		}
+		jobs = static_cast<unsigned>(*n);
+	}
+	if (jobs > 1 && g_delay_ms != 0) {
+		// A blocking per-fetch sleep would stall the single requestor thread and
+		// serialize the workers; jobs is the throttle here, so drop the delay.
+		std::println(stderr, "{}: --delay ignored with --jobs > 1 (jobs bounds concurrency instead)", program);
+		g_delay_ms = 0;
+	}
+
+	// One stop_source for the whole download; SIGINT cancels every in-flight fetch.
+	std::stop_source stop;
+	SignalGuard signal_guard(stop);
 
 	ParserStore store;
 	populate_store(store);
@@ -1000,7 +1112,7 @@ int download(std::span<const std::string_view> args, bool json) {
 				std::println(stderr, "{}: parse failed: {}", program, getter.error().message);
 				return Runtime;
 			}
-			dump_container(ready, **getter, dest, filters, json, result);
+			dump_container(ready, **getter, dest, filters, json, result, stop, jobs);
 		} else if (route->type == GetterSuggestionType::Manga) {
 			auto root = route->parser->mangas_getter();
 			auto getter = coro::sync_wait(root->parse_url(ready, std::move(route->url)));
@@ -1008,7 +1120,7 @@ int download(std::span<const std::string_view> args, bool json) {
 				std::println(stderr, "{}: parse failed: {}", program, getter.error().message);
 				return Runtime;
 			}
-			dump_manga(ready, **getter, dest, chapters_spec, json, result);
+			dump_manga(ready, **getter, dest, chapters_spec, json, result, stop, jobs);
 		} else {
 			std::println(stderr, "{}: download supports image and manga URLs", program);
 			return Usage;
@@ -1044,11 +1156,11 @@ int download(std::span<const std::string_view> args, bool json) {
 	if (doc.is_array()) {
 		for (const auto& v : doc.as_array()) {
 			if (v.is_object()) {
-				dump_serialized(store, ctx, v.as_object(), dest, filters, chapters_spec, json, result);
+				dump_serialized(store, ctx, v.as_object(), dest, filters, chapters_spec, json, result, stop, jobs);
 			}
 		}
 	} else if (doc.is_object()) {
-		dump_serialized(store, ctx, doc.as_object(), dest, filters, chapters_spec, json, result);
+		dump_serialized(store, ctx, doc.as_object(), dest, filters, chapters_spec, json, result, stop, jobs);
 	} else {
 		std::println(stderr, "{}: stdin JSON must be an object or array of records", program);
 		return Usage;
