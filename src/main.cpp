@@ -17,6 +17,7 @@
 #include <coro/sync_wait.hpp>
 
 #include <charconv>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <format>
@@ -29,12 +30,17 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
 using namespace aniparse;
 
 constexpr std::string_view program = "anip";
+
+// Diagnostic: sleep this long before each image fetch to probe source rate limits
+// (some CDNs 403 a burst of page requests). 0 = off; set via download's --delay <ms>.
+unsigned g_delay_ms = 0;
 
 // 0 ok, 1 runtime error, 2 usage/validation error. --help exits 0.
 enum ExitCode : int { Ok = 0, Runtime = 1, Usage = 2 };
@@ -50,7 +56,7 @@ int usage() {
 	    "  latest -p <parser> [--from N] [--limit N] [--sort KEY] [--asc]\n"
 	    "  search -p <parser> -q <query> [--filter k=v ...] [--from N] [--limit N]\n"
 	    "  parse <url>             route a URL to its source and fetch info\n"
-	    "  download [<url>] [--dest DIR] [--limit N] [--chapters 1-4,8]  save files\n"
+	    "  download [<url>] [--dest DIR] [--limit N] [--chapters 1-4,8] [--delay MS]  save files\n"
 	    "                          (image container, or manga chapters->pages;\n"
 	    "                           no <url>: read search/latest --json records from stdin)\n"
 	    "\n"
@@ -671,6 +677,25 @@ std::string filename_from_url(std::string_view url, pageoff index) {
 	return std::string(base);
 }
 
+/// Build a path from UTF-8 bytes. On Windows a path made from a narrow std::string
+/// is decoded with the ANSI code page, so source-derived text (JSON titles, URL
+/// basenames — all UTF-8) lands on disk as mojibake even though the console (UTF-8)
+/// round-trips it back and shows it fine. Constructing from char8_t forces the
+/// correct UTF-8 -> native (UTF-16) conversion. On POSIX the native encoding is
+/// already UTF-8, so this is a plain copy.
+std::filesystem::path utf8_path(std::string_view s) {
+	return std::filesystem::path(
+	    std::u8string(reinterpret_cast<const char8_t*>(s.data()), s.size()));
+}
+
+/// Render a path as UTF-8 for display/JSON. The inverse of utf8_path: path::string()
+/// on Windows narrows via the ANSI code page (lossy for non-Latin), so print the
+/// UTF-8 form explicitly so a UTF-8 console (and JSON output) shows the real name.
+std::string path_utf8(const std::filesystem::path& p) {
+	const std::u8string u8 = p.u8string();
+	return std::string(reinterpret_cast<const char*>(u8.data()), u8.size());
+}
+
 struct DumpResult {
 	int ok = 0;
 	int failed = 0;
@@ -682,6 +707,9 @@ struct DumpResult {
 /// — fine for stills, video/huge waits on streaming.
 void write_image(RequestorContext& ctx, const Image& image, const std::filesystem::path& dir,
                  pageoff index, bool json, DumpResult& acc) {
+	if (g_delay_ms != 0) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(g_delay_ms));
+	}
 	auto resp = coro::sync_wait(ctx.request(GetRequest{ .url = image.url, .headers = image.headers }));
 	if (!resp || resp->status_code >= 400 || resp->body.empty()) {
 		++acc.failed;
@@ -689,19 +717,19 @@ void write_image(RequestorContext& ctx, const Image& image, const std::filesyste
 		    resp ? std::format(" (http {})", resp->status_code) : std::string{});
 		return;
 	}
-	const std::filesystem::path out = dir / filename_from_url(image.url, index);
+	const std::filesystem::path out = dir / utf8_path(filename_from_url(image.url, index));
 	std::ofstream file(out, std::ios::binary);
 	if (!file) {
 		++acc.failed;
-		std::println(stderr, "{}: cannot open {}", program, out.string());
+		std::println(stderr, "{}: cannot open {}", program, path_utf8(out));
 		return;
 	}
 	file.write(resp->body.data(), static_cast<std::streamsize>(resp->body.size()));
 	++acc.ok;
 	if (json) {
-		acc.written.emplace_back(out.string());
+		acc.written.emplace_back(path_utf8(out));
 	} else {
-		std::println("  {} ({} bytes)", out.string(), resp->body.size());
+		std::println("  {} ({} bytes)", path_utf8(out), resp->body.size());
 	}
 }
 
@@ -812,7 +840,7 @@ void dump_manga(RequestorContext& ctx, MangaGetter& manga, const std::string& de
 
 	for (const std::size_t idx : *selected) {
 		const MangaChapterInfo& ch = list[idx].item;
-		const std::filesystem::path dir = std::filesystem::path(dest) / chapter_dirname(ch, idx);
+		const std::filesystem::path dir = std::filesystem::path(dest) / utf8_path(chapter_dirname(ch, idx));
 		std::error_code ec;
 		std::filesystem::create_directories(dir, ec);
 
@@ -915,7 +943,7 @@ int download(std::span<const std::string_view> args, bool json) {
 	std::optional<std::string_view> url;
 	for (std::size_t i = 0; i < args.size(); ++i) {
 		const std::string_view a = args[i];
-		if (a == "--dest" || a == "--limit" || a == "--chapters") {
+		if (a == "--dest" || a == "--limit" || a == "--chapters" || a == "--delay") {
 			++i; // consume the flag's value
 			continue;
 		}
@@ -941,6 +969,14 @@ int download(std::span<const std::string_view> args, bool json) {
 	std::string chapters_spec; // manga only; empty = all chapters
 	if (const auto c = flag_value(args, "--chapters")) {
 		chapters_spec = std::string(*c);
+	}
+	if (const auto d = flag_value(args, "--delay")) { // diagnostic: ms between image fetches
+		const auto n = parse_uint(*d);
+		if (!n) {
+			std::println(stderr, "{}: --delay expects a non-negative integer (milliseconds)", program);
+			return Usage;
+		}
+		g_delay_ms = static_cast<unsigned>(*n);
 	}
 
 	ParserStore store;
