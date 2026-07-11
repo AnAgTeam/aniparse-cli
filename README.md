@@ -102,3 +102,49 @@ export ANIP_GELBOORU_USER=123456
 export ANIP_GELBOORU_PASSWORD=<api_key>
 anip search -p Gelbooru -q cat_ears --json
 ```
+
+## Examples
+
+```sh
+# discover what is available, and what a source accepts
+anip list parsers
+anip list filters
+anip support search -p AniList
+
+# search a metadata source, cap the result count
+anip search -p AniList -q "chainsaw man" --limit 5
+anip search -p Kitsu -q berserk --sort rating --limit 10
+
+# structured filters: repeatable --filter is AND across keys; k=!v excludes.
+# AniList advertises a `genres` selection (Action, Drama, Ecchi, Fantasy, …):
+anip search -p AniList --filter genres=Action --filter genres=Drama --filter genres=!Ecchi \
+  --sort popularity --limit 20
+
+# browse the newest items, sorted (default order is descending; --asc flips it)
+anip latest -p AniList --limit 10
+
+# route any URL to whichever source owns it
+anip parse "https://anilist.co/manga/30002"
+
+# machine-readable output, post-processed with jq (metadata, no download)
+anip --json search -p AniList -q naruto --limit 3 | jq -r '.[].title'
+
+# the search|download pipe — find, then save every result (no URL: read stdin).
+# search --json emits one {parser, handle} record per hit:
+anip --json search -p Danbooru -q landscape --limit 2
+# [{"offset":0,"title":"…","parser":"Danbooru","handle":{"url":"…","params":{}}}, …]
+# download rebuilds each getter from those handles (from_serialized) and saves it:
+anip --json search -p Danbooru -q landscape --limit 5 | anip download --dest ./out --jobs 8
+
+# the handle is opaque — stash the JSON, filter it later with jq, then download:
+anip --json search -p Danbooru -q scenery --limit 50 > feed.json
+jq '[.[] | select(.title | test("mountain"))]' feed.json | anip download --dest ./out
+
+# download a single post URL directly; --chapters selects ranges for manga sources
+anip download "https://danbooru.donmai.us/posts/1234567" --dest ./out --jobs 8
+anip download "<manga-url>" --chapters 1-4,8 --dest ./out
+
+# an authenticated source — env keeps the key out of argv, then pipe into download
+export ANIP_GELBOORU_USER=123456 ANIP_GELBOORU_PASSWORD=<api_key>
+anip --json search -p Gelbooru -q cat_ears --limit 10 | anip download --dest ./gel --jobs 4
+```
