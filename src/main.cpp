@@ -6,78 +6,34 @@
  * cron trackers on latest --json). All verbs are implemented; download handles
  * image containers by buffering each file (request()->body), with streaming/CBZ
  * and a serialized-handle input (to close search|download) still to come.
+ *
+ * This TU owns verb dispatch, the search/latest/support/parse verbs, and the shared
+ * low-level helpers declared in CliCommon.hpp. The filter vocabulary lives in
+ * CliFilters.cpp and the download machinery in CliDownload.cpp.
  */
+#include "CliCommon.hpp"
+
 #include <aniparse/ParserStore.hpp>
 #include <aniparse/Client.hpp>
 #include <aniparse/parsers/DefaultParsers.hpp>
-#include <aniparse/net/CancellingTask.hpp> // asyncnet::NetworkTask (backend-neutral)
 
 #include "anip_extensions.hpp" // generated: register_extensions (seam A)
 
 #include <boost/json.hpp>
 #include <coro/sync_wait.hpp>
-#include <coro/when_all.hpp>
 
-#include <algorithm>
-#include <atomic>
 #include <charconv>
-#include <chrono>
-#include <csignal>
 #include <cstdint>
-#include <filesystem>
-#include <format>
-#include <fstream>
-#include <iostream>
 #include <memory>
-#include <numeric>
 #include <optional>
 #include <print>
 #include <span>
-#include <stop_token>
 #include <string>
 #include <string_view>
-#include <thread>
-#include <variant>
 #include <vector>
 
-namespace {
+namespace anip::cli {
 using namespace aniparse;
-
-constexpr std::string_view program = "anip";
-
-// Diagnostic: sleep this long before each image fetch to probe source rate limits
-// (some CDNs 403 a burst of page requests). 0 = off; set via download's --delay <ms>.
-// Neutralized when --jobs > 1 (blocking sleep would stall the requestor thread).
-unsigned g_delay_ms = 0;
-
-// Set for the duration of a download so Ctrl-C (SIGINT) requests cancellation of
-// every in-flight fetch — the shared stop_source reaches each request — instead of
-// hard-killing mid-write. request_stop is thread-safe; on Windows the handler runs
-// on its own thread, so touching the atomic pointer from there is fine.
-std::atomic<std::stop_source*> g_active_stop{ nullptr };
-void on_interrupt(int) {
-	if (std::stop_source* stop = g_active_stop.load()) {
-		stop->request_stop();
-	}
-}
-
-/// Installs on_interrupt for SIGINT while alive, pointing it at @p stop; restores
-/// the default handler on scope exit (download has many return paths).
-struct SignalGuard {
-	explicit SignalGuard(std::stop_source& stop) {
-		g_active_stop.store(&stop);
-		std::signal(SIGINT, on_interrupt);
-	}
-	~SignalGuard() {
-		std::signal(SIGINT, SIG_DFL);
-		g_active_stop.store(nullptr);
-	}
-	SignalGuard(const SignalGuard&) = delete;
-	SignalGuard& operator=(const SignalGuard&) = delete;
-};
-
-// 0 ok, 1 runtime error, 2 usage/validation error. --help exits 0.
-enum ExitCode : int { Ok = 0, Runtime = 1, Usage = 2 };
 
 int usage() {
 	std::println(stderr,
@@ -102,7 +58,6 @@ int usage() {
 	return Usage;
 }
 
-/// Decode the capability bitfield into short human labels for a listing row.
 std::vector<std::string_view> capability_labels(const CompatibilitiesFlags& f) {
 	using namespace compatibilities_flags;
 	std::vector<std::string_view> out;
@@ -128,8 +83,6 @@ std::string join(const std::vector<std::string_view>& parts, std::string_view se
 	return out;
 }
 
-/// Build a store: the public showcase parsers plus any extension parser sets
-/// linked into this build (seam A — see cmake/anip_extensions.hpp.in).
 void populate_store(ParserStore& store) {
 	parsers::emplace_default_parsers(store);
 	anip::register_extensions(store);
@@ -168,8 +121,6 @@ int list_parsers(bool json) {
 	return Ok;
 }
 
-int list_filters(bool json); // defined below
-
 int list(std::span<const std::string_view> args, bool json) {
 	if (args.empty()) {
 		std::println(stderr, "{}: list needs a subcommand (parsers|filters)", program);
@@ -185,8 +136,6 @@ int list(std::span<const std::string_view> args, bool json) {
 	return usage();
 }
 
-/// The value token following @p name (e.g. "-p"), or nullopt if @p name is absent
-/// or has no following token.
 std::optional<std::string_view> flag_value(std::span<const std::string_view> args,
                                            std::string_view name) {
 	for (std::size_t i = 0; i + 1 < args.size(); ++i) {
@@ -206,7 +155,6 @@ bool has_flag(std::span<const std::string_view> args, std::string_view name) {
 	return false;
 }
 
-/// Parse a non-negative integer that consumes the whole token; nullopt otherwise.
 std::optional<long long> parse_uint(std::string_view s) {
 	long long value = 0;
 	const auto* const end = s.data() + s.size();
@@ -244,108 +192,6 @@ std::optional<GetFilters> parse_filters(std::span<const std::string_view> args) 
 		filters.sort = SortOrder{ .key = std::string(*v), .ascending = has_flag(args, "--asc") };
 	}
 	return filters;
-}
-
-/// Parse an int filter value: "N" (exact), "A-B" (range), "A-" (min), "-B" (max).
-std::optional<IntInterval> parse_int_interval(std::string_view v, bool exclusive) {
-	IntInterval interval;
-	interval.exclusive = exclusive;
-	auto to_num = [](std::string_view s) -> std::optional<std::ptrdiff_t> {
-		const auto n = parse_uint(s);
-		return n ? std::optional<std::ptrdiff_t>(static_cast<std::ptrdiff_t>(*n)) : std::nullopt;
-	};
-	const std::size_t dash = v.find('-');
-	if (dash == std::string_view::npos) {
-		const auto n = to_num(v);
-		if (!n) {
-			return std::nullopt;
-		}
-		interval.from = *n;
-		interval.to   = *n;
-		return interval;
-	}
-	const std::string_view lo = v.substr(0, dash);
-	const std::string_view hi = v.substr(dash + 1);
-	if (lo.empty() && hi.empty()) {
-		return std::nullopt;
-	}
-	if (!lo.empty()) {
-		const auto n = to_num(lo);
-		if (!n) {
-			return std::nullopt;
-		}
-		interval.from = *n;
-	}
-	if (!hi.empty()) {
-		const auto n = to_num(hi);
-		if (!n) {
-			return std::nullopt;
-		}
-		interval.to = *n;
-	}
-	return interval;
-}
-
-/// Build structured search filters from repeated `--filter k=v` (v may be `!x` to
-/// exclude), typed against the source's declared @p supported table: the variant
-/// alternative each key declares (TextQuery / ItemSelection / IntInterval /
-/// Checkmark) drives how the value is parsed. Repeated ItemSelection keys accumulate
-/// (multi-tag AND). Prints and returns nullopt on an unknown key or malformed value.
-std::optional<SearchItems> build_search_filters(std::span<const std::string_view> args,
-                                                const SearchItems& supported) {
-	SearchItems out;
-	for (std::size_t i = 0; i + 1 < args.size(); ++i) {
-		if (args[i] != "--filter") {
-			continue;
-		}
-		const std::string_view kv = args[i + 1];
-		const std::size_t eq = kv.find('=');
-		if (eq == std::string_view::npos) {
-			std::println(stderr, "{}: --filter expects k=v (got '{}')", program, kv);
-			return std::nullopt;
-		}
-		const std::string key = std::string(kv.substr(0, eq));
-		std::string_view    val = kv.substr(eq + 1);
-		bool exclusive = false;
-		if (!val.empty() && val.front() == '!') {
-			exclusive = true;
-			val.remove_prefix(1);
-		}
-
-		const auto decl = supported.find(key);
-		if (decl == supported.end()) {
-			std::println(stderr, "{}: unknown filter '{}' for this source (try `{} support search -p <parser>`)",
-			             program, key, program);
-			return std::nullopt;
-		}
-
-		const SearchItemVariant& type = decl->second;
-		if (std::holds_alternative<TextQuery>(type)) {
-			out[key] = TextQuery{ .text = std::string(val), .exclusive = exclusive };
-		} else if (std::holds_alternative<ItemSelection>(type)) {
-			// Just accumulate the token; membership (for enumerated axes) and exclusion
-			// support are validated centrally by validate_query in run_search.
-			auto it = out.find(key);
-			if (it == out.end()) {
-				it = out.emplace(key, ItemSelection{}).first;
-			}
-			std::get<ItemSelection>(it->second)[std::string(val)] =
-			    ItemSelectionValue{ .name = std::string(val), .exclusive = exclusive };
-		} else if (std::holds_alternative<IntInterval>(type)) {
-			const auto interval = parse_int_interval(val, exclusive);
-			if (!interval) {
-				std::println(stderr, "{}: --filter {} expects a number or range a-b", program, key);
-				return std::nullopt;
-			}
-			out[key] = *interval;
-		} else if (std::holds_alternative<Checkmark>(type)) {
-			out[key] = Checkmark{ .exclusive = exclusive };
-		} else {
-			std::println(stderr, "{}: --filter {} has a type this CLI can't express yet", program, key);
-			return std::nullopt;
-		}
-	}
-	return out;
 }
 
 /// Print a fetched page of container getters (shared by latest and search).
@@ -608,235 +454,6 @@ int parse_verb(std::span<const std::string_view> args, bool json) {
 	return Runtime;
 }
 
-int list_filters(bool json) {
-	using namespace search_keys;
-	struct Key { std::string_view key; std::string_view about; };
-	// The canonical filter keys the library exposes (values a source may accept and
-	// that --filter will speak). episodes is an alias of pages; both map to "icount".
-	static constexpr Key keys[] = {
-	    { title,           "title text" },
-	    { series,          "series / franchise" },
-	    { tag,             "a content tag" },
-	    { pages,           "chapter/page count (alias: episodes)" },
-	    { status,          "publication status" },
-	    { rating,          "content rating" },
-	    { year,            "release year" },
-	    { release_time,    "release date" },
-	    { upload_time,     "upload date" },
-	    { age_restriction, "minimum age" },
-	    { artist,          "artist" },
-	    { character,       "character" },
-	    { group,           "scanlation / translation group" },
-	    { type,            "media type" },
-	    { language,        "language" },
-	};
-
-	if (json) {
-		boost::json::array arr;
-		for (const Key& k : keys) {
-			boost::json::object o;
-			o["key"]   = std::string(k.key);
-			o["about"] = std::string(k.about);
-			arr.push_back(std::move(o));
-		}
-		std::println("{}", boost::json::serialize(boost::json::value(std::move(arr))));
-		return Ok;
-	}
-
-	std::println("Canonical search-filter keys (the library vocabulary):");
-	for (const Key& k : keys) {
-		std::println("  {:<10} {}", k.key, k.about);
-	}
-
-	std::println("\n--filter k=v value syntax (a source declares each key's type):");
-	std::println("  ItemSelection  k=token     repeatable = AND    e.g. --filter tag=a --filter tag=b");
-	std::println("  TextQuery      k=text                          e.g. --filter title=naruto");
-	std::println("  IntInterval    k=N | A-B | A- | -B             e.g. --filter icount=20-50");
-	std::println("  Checkmark      k=1          (any value enables the flag)");
-	std::println("  exclude (NOT)  prefix the value with '!'       e.g. --filter tag=!guro");
-	std::println("  combine        different keys = AND across axes; needs -q or --filter");
-
-	std::println("\nWhich keys (and types) a source accepts: {} support search -p <parser>", program);
-	return Ok;
-}
-
-/// The declared type of one filter as a short token — shared by the human and JSON
-/// `support search` output so they never drift.
-std::string_view filter_type_name(const SearchItemVariant& value) {
-	if (std::holds_alternative<ItemSelection>(value))         { return "selection"; }
-	if (std::holds_alternative<TextQuery>(value))             { return "text"; }
-	if (std::holds_alternative<IntInterval>(value))           { return "int"; }
-	if (std::holds_alternative<Checkmark>(value))             { return "flag"; }
-	if (std::holds_alternative<TimeInterval>(value))          { return "time"; }
-	if (std::holds_alternative<RelativeTimeInterval>(value))  { return "rel-time"; }
-	return "unknown";
-}
-
-/// Up to @p max "label(token)" samples from an enumerated selection, then a
-/// "… (N total)" tail. The value the user types is the token (the map key); the
-/// label is what the source shows for it.
-std::string selection_sample(const ItemSelection& selection, std::size_t max = 6) {
-	std::string out;
-	std::size_t i = 0;
-	for (const auto& [token, value] : selection) {
-		if (i >= max) {
-			out += std::format(" … ({} total)", selection.size());
-			break;
-		}
-		if (i) {
-			out += ", ";
-		}
-		out += value.name.empty() ? std::string(token) : std::format("{}({})", value.name, token);
-		++i;
-	}
-	return out;
-}
-
-/// The SOURCE-SPECIFIC detail for one filter — what `list filters` cannot show: the
-/// options to choose from for an enumerated selection, or that it is open-vocabulary
-/// / free text. The value-writing syntax by type lives in `list filters`, so it is
-/// deliberately NOT repeated here.
-std::string filter_detail(const SearchItemVariant& value) {
-	if (const auto* selection = std::get_if<ItemSelection>(&value)) {
-		if (selection->empty()) {
-			return "open vocabulary — any token";
-		}
-		return std::format("from: {}", selection_sample(*selection));
-	}
-	if (std::holds_alternative<TextQuery>(value)) {
-		return "any text";
-	}
-	return {}; // int / flag / time: the type name + `list filters` syntax is enough
-}
-
-std::string sort_directions(const SortDescriptor& d) {
-	std::string out;
-	if (d.ascending) {
-		out += "asc";
-	}
-	if (d.descending) {
-		if (!out.empty()) {
-			out += "/";
-		}
-		out += "desc";
-	}
-	return out.empty() ? "(none)" : out;
-}
-
-int print_search_support(std::string_view source, std::string_view category,
-                         const SearchCompatibilities& sc, bool json) {
-	if (json) {
-		boost::json::array filters;
-		for (const auto& [key, value] : sc.supported_filters) {
-			boost::json::object f;
-			f["key"]  = key;
-			f["type"] = std::string(filter_type_name(value));
-			// Enumerated options only: an empty selection is open-vocabulary and has
-			// none to list. Token is what --filter takes; label is the display name.
-			if (const auto* selection = std::get_if<ItemSelection>(&value); selection && !selection->empty()) {
-				boost::json::array options;
-				for (const auto& [token, opt] : *selection) {
-					boost::json::object o;
-					o["token"] = token;
-					o["label"] = opt.name;
-					options.push_back(std::move(o));
-				}
-				f["options"] = std::move(options);
-			}
-			filters.push_back(std::move(f));
-		}
-		boost::json::array sorts;
-		for (const auto& [key, dir] : sc.supported_sorts) {
-			boost::json::object o;
-			o["key"]  = key;
-			o["asc"]  = dir.ascending;
-			o["desc"] = dir.descending;
-			sorts.push_back(std::move(o));
-		}
-		boost::json::array flags;
-		for (const std::string_view f : capability_labels(sc.compatibilities)) {
-			flags.emplace_back(f);
-		}
-		boost::json::array kinds;
-		for (const std::string& k : sc.supported_suggestion_kinds) {
-			kinds.emplace_back(k);
-		}
-		boost::json::object o;
-		o["source"]           = std::string(source);
-		o["category"]         = std::string(category);
-		o["filters"]          = std::move(filters);
-		o["sorts"]            = std::move(sorts);
-		o["flags"]            = std::move(flags);
-		o["suggestion_kinds"] = std::move(kinds);
-		std::println("{}", boost::json::serialize(boost::json::value(std::move(o))));
-		return Ok;
-	}
-
-	std::println("Source:  {} ({}) — search", source, category);
-	if (sc.supported_filters.empty()) {
-		std::println("Filters: (free-text query only)");
-	} else {
-		std::println("Filters: (prefix a value with '!' to exclude; different keys = AND; "
-		             "value syntax: {} list filters)", program);
-		for (const auto& [key, value] : sc.supported_filters) {
-			std::println("  {:<10} {:<9} {}", key, filter_type_name(value), filter_detail(value));
-		}
-	}
-	if (sc.supported_sorts.empty()) {
-		std::println("Sorts:   (source default only)");
-	} else {
-		std::println("Sorts:");
-		for (const auto& [key, dir] : sc.supported_sorts) {
-			std::println("  {:<14} [{}]", key, sort_directions(dir));
-		}
-	}
-	std::println("Flags:   {}", join(capability_labels(sc.compatibilities), ", "));
-	if (!sc.supported_suggestion_kinds.empty()) {
-		std::vector<std::string_view> kinds(sc.supported_suggestion_kinds.begin(),
-		                                    sc.supported_suggestion_kinds.end());
-		std::println("Suggest: {}", join(kinds, ", "));
-	}
-	return Ok;
-}
-
-int print_latest_support(std::string_view source, std::string_view category,
-                         const SupportedSorts& sorts, const CompatibilitiesFlags& flags,
-                         bool json) {
-	if (json) {
-		boost::json::array sortarr;
-		for (const auto& [key, dir] : sorts) {
-			boost::json::object o;
-			o["key"]  = key;
-			o["asc"]  = dir.ascending;
-			o["desc"] = dir.descending;
-			sortarr.push_back(std::move(o));
-		}
-		boost::json::array flagarr;
-		for (const std::string_view f : capability_labels(flags)) {
-			flagarr.emplace_back(f);
-		}
-		boost::json::object o;
-		o["source"]   = std::string(source);
-		o["category"] = std::string(category);
-		o["sorts"]    = std::move(sortarr);
-		o["flags"]    = std::move(flagarr);
-		std::println("{}", boost::json::serialize(boost::json::value(std::move(o))));
-		return Ok;
-	}
-
-	std::println("Source:  {} ({}) — latest", source, category);
-	if (sorts.empty()) {
-		std::println("Sorts:   (source default only)");
-	} else {
-		std::println("Sorts:");
-		for (const auto& [key, dir] : sorts) {
-			std::println("  {:<14} [{}]", key, sort_directions(dir));
-		}
-	}
-	std::println("Flags:   {}", join(capability_labels(flags), ", "));
-	return Ok;
-}
-
 /// sync_wait a root getter's search_support and unwrap it; nullopt (after
 /// printing) on error. Templated so one body serves manga and images roots.
 template <typename RootGetterPtr>
@@ -903,476 +520,6 @@ int support(std::span<const std::string_view> args, bool json) {
 	return print_latest_support(source, category, s.supported_sorts, s.compatibilities, json);
 }
 
-/// A filename for a downloaded image: the URL's basename (query stripped), or a
-/// synthetic item_<index> when the URL carries none.
-std::string filename_from_url(std::string_view url, pageoff index) {
-	const std::string_view path = url.substr(0, url.find_first_of("?#"));
-	const auto slash = path.find_last_of('/');
-	const std::string_view base = (slash == std::string_view::npos) ? path : path.substr(slash + 1);
-	if (base.empty()) {
-		return "item_" + std::to_string(static_cast<long long>(index));
-	}
-	return std::string(base);
-}
-
-/// Build a path from UTF-8 bytes. On Windows a path made from a narrow std::string
-/// is decoded with the ANSI code page, so source-derived text (JSON titles, URL
-/// basenames — all UTF-8) lands on disk as mojibake even though the console (UTF-8)
-/// round-trips it back and shows it fine. Constructing from char8_t forces the
-/// correct UTF-8 -> native (UTF-16) conversion. On POSIX the native encoding is
-/// already UTF-8, so this is a plain copy.
-std::filesystem::path utf8_path(std::string_view s) {
-	return std::filesystem::path(
-	    std::u8string(reinterpret_cast<const char8_t*>(s.data()), s.size()));
-}
-
-/// Render a path as UTF-8 for display/JSON. The inverse of utf8_path: path::string()
-/// on Windows narrows via the ANSI code page (lossy for non-Latin), so print the
-/// UTF-8 form explicitly so a UTF-8 console (and JSON output) shows the real name.
-std::string path_utf8(const std::filesystem::path& p) {
-	const std::u8string u8 = p.u8string();
-	return std::string(reinterpret_cast<const char*>(u8.data()), u8.size());
-}
-
-struct DumpResult {
-	int ok = 0;
-	int failed = 0;
-	boost::json::array written;
-};
-
-/// Fetch one image and write it into @p dir. A NetworkTask (not a plain function)
-/// so it composes under for_each_concurrent: co_awaited inside a worker it inherits
-/// the worker's stop_source, so a cancel reaches the in-flight request. The shared
-/// leaf of every download path; whole image buffered — fine for stills, video/huge
-/// waits on streaming. Resumes on the requestor thread, so the counter/output writes
-/// below are serialized with every other worker (one requestor thread) — no locks.
-asyncnet::NetworkTask<void> fetch_and_write(RequestorContext& ctx, Image image,
-                                            std::filesystem::path dir, pageoff index,
-                                            bool json, DumpResult& acc) {
-	if (g_delay_ms != 0) {
-		std::this_thread::sleep_for(std::chrono::milliseconds(g_delay_ms));
-	}
-	auto resp = co_await ctx.request(GetRequest{ .url = image.url, .headers = image.headers });
-	if (!resp || resp->status_code >= 400 || resp->body.empty()) {
-		++acc.failed;
-		std::println(stderr, "{}: item {} failed{}", program, static_cast<long long>(index),
-		    resp ? std::format(" (http {})", resp->status_code) : std::string{});
-		co_return;
-	}
-	const std::filesystem::path out = dir / utf8_path(filename_from_url(image.url, index));
-	std::ofstream file(out, std::ios::binary);
-	if (!file) {
-		++acc.failed;
-		std::println(stderr, "{}: cannot open {}", program, path_utf8(out));
-		co_return;
-	}
-	file.write(resp->body.data(), static_cast<std::streamsize>(resp->body.size()));
-	++acc.ok;
-	if (json) {
-		acc.written.emplace_back(path_utf8(out));
-	} else {
-		std::println("  {} ({} bytes)", path_utf8(out), resp->body.size());
-	}
-}
-
-/// One worker: pull the next index off the shared cursor and run make_task(i) for it
-/// until the range is drained or a stop is requested (stops starting new items; an
-/// in-flight one is cancelled via the stop_source wired in by for_each_concurrent).
-template<typename MakeTask>
-asyncnet::NetworkTask<void> download_worker(std::shared_ptr<std::atomic<std::size_t>> cursor,
-                                            std::size_t count, std::stop_token stop,
-                                            MakeTask make_task) {
-	for (std::size_t i = cursor->fetch_add(1); i < count; i = cursor->fetch_add(1)) {
-		if (stop.stop_requested()) {
-			break;
-		}
-		co_await make_task(i);
-	}
-}
-
-/// Run make_task(i) for i in [0, count) with at most @p jobs in flight, all sharing
-/// @p stop, and barrier-join. This is asyncnet::gather(stop, ...) inlined for a
-/// runtime-sized set: wire the shared stop into each worker (update_stop_source, so a
-/// cancel reaches its request) then coro::when_all them. A shared atomic cursor bounds
-/// live coroutine frames to `jobs` (not `count`) — matters for thousand-page manga.
-template<typename MakeTask>
-asyncnet::NetworkTask<void> for_each_concurrent(std::stop_source stop, std::size_t count,
-                                                unsigned jobs, MakeTask make_task) {
-	if (count == 0) {
-		co_return;
-	}
-	// Clamp width to [1, count] without std::min/max (windows.h defines min/max macros).
-	unsigned width = jobs < 1u ? 1u : jobs;
-	if (static_cast<std::size_t>(width) > count) {
-		width = static_cast<unsigned>(count);
-	}
-	auto cursor = std::make_shared<std::atomic<std::size_t>>(0);
-	std::vector<asyncnet::NetworkTask<void>> workers;
-	workers.reserve(width);
-	for (unsigned w = 0; w < width; ++w) {
-		workers.push_back(download_worker(cursor, count, stop.get_token(), make_task));
-	}
-	for (auto& worker : workers) {
-		worker.update_stop_source(stop); // so request_stop cancels the request, not just the loop
-	}
-	co_await coro::when_all(std::move(workers));
-}
-
-/// Replace characters a path segment can't hold on Windows/POSIX with '_'.
-std::string sanitize_segment(std::string_view s) {
-	std::string out;
-	for (const char c : s) {
-		const bool bad = c == '/' || c == '\\' || c == ':' || c == '*' || c == '?'
-		              || c == '"' || c == '<' || c == '>' || c == '|';
-		out += bad ? '_' : c;
-	}
-	return out;
-}
-
-/// A per-chapter subdirectory name: the source's own number when it has one,
-/// else vol/chapter, else the 1-based index; the title is appended when present.
-std::string chapter_dirname(const MangaChapterInfo& ch, std::size_t index) {
-	std::string label;
-	if (!ch.number.empty()) {
-		label = "ch" + ch.number;
-	} else if (ch.chapter != 0 || ch.volume != 0) {
-		label = "vol" + std::to_string(ch.volume) + "_ch" + std::to_string(ch.chapter);
-	} else {
-		label = "chapter_" + std::to_string(index + 1);
-	}
-	if (!ch.name.empty()) {
-		label += "_" + ch.name;
-	}
-	return sanitize_segment(label);
-}
-
-/// Parse a chapter range spec ("1-4,8,11", 1-based) into 0-based indices within
-/// [0,count). Empty or "all" selects everything. nullopt (after printing) on a
-/// malformed spec.
-std::optional<std::vector<std::size_t>> parse_ranges(std::string_view spec, std::size_t count) {
-	std::vector<std::size_t> out;
-	if (spec.empty() || spec == "all") {
-		out.resize(count);
-		std::iota(out.begin(), out.end(), std::size_t{ 0 });
-		return out;
-	}
-	std::size_t pos = 0;
-	while (pos < spec.size()) {
-		const std::size_t comma = spec.find(',', pos);
-		const std::string_view tok =
-		    spec.substr(pos, comma == std::string_view::npos ? std::string_view::npos : comma - pos);
-		pos = (comma == std::string_view::npos) ? spec.size() : comma + 1;
-		if (tok.empty()) {
-			continue;
-		}
-		const std::size_t dash = tok.find('-');
-		if (dash == std::string_view::npos) {
-			const auto n = parse_uint(tok);
-			if (!n || *n < 1) {
-				std::println(stderr, "{}: bad chapter range '{}'", program, tok);
-				return std::nullopt;
-			}
-			if (static_cast<std::size_t>(*n) <= count) {
-				out.push_back(static_cast<std::size_t>(*n) - 1);
-			}
-		} else {
-			const auto lo = parse_uint(tok.substr(0, dash));
-			const auto hi = parse_uint(tok.substr(dash + 1));
-			if (!lo || !hi || *lo < 1 || *hi < *lo) {
-				std::println(stderr, "{}: bad chapter range '{}'", program, tok);
-				return std::nullopt;
-			}
-			for (long long i = *lo; i <= *hi && static_cast<std::size_t>(i) <= count; ++i) {
-				out.push_back(static_cast<std::size_t>(i) - 1);
-			}
-		}
-	}
-	return out;
-}
-
-/// Fetch an image container's items and write each into @p dest, up to @p jobs at a
-/// time (all cancellable via @p stop).
-void dump_container(RequestorContext& ctx, ImageContainerGetter& container,
-                    const std::string& dest, GetFilters filters, bool json, DumpResult& acc,
-                    const std::stop_source& stop, unsigned jobs) {
-	auto items = coro::sync_wait(container.items(ctx, filters));
-	if (!items) {
-		std::println(stderr, "{}: items failed: {}", program, items.error().message);
-		++acc.failed;
-		return;
-	}
-	std::error_code ec;
-	std::filesystem::create_directories(dest, ec);
-	auto& entries = items->results;
-	const std::filesystem::path dest_path(dest); // CLI arg (ANSI on Windows) — path(dest) is correct
-	auto make_task = [&ctx, &acc, dest_path, json, &entries](std::size_t i) {
-		return fetch_and_write(ctx, entries[i].item.image, dest_path, entries[i].offset, json, acc);
-	};
-	coro::sync_wait(for_each_concurrent(stop, entries.size(), jobs, make_task));
-}
-
-/// Fetch a manga's chapters (those selected by @p chapters_spec) and write each
-/// chapter's pages into a <dest>/<chapter> subdirectory.
-void dump_manga(RequestorContext& ctx, MangaGetter& manga, const std::string& dest,
-                std::string_view chapters_spec, bool json, DumpResult& acc,
-                const std::stop_source& stop, unsigned jobs) {
-	auto chapters = coro::sync_wait(manga.chapters_info(ctx, GetFilters{}));
-	if (!chapters) {
-		std::println(stderr, "{}: chapters failed: {}", program, chapters.error().message);
-		++acc.failed;
-		return;
-	}
-	const auto& list = chapters->results;
-	const std::optional<std::vector<std::size_t>> selected = parse_ranges(chapters_spec, list.size());
-	if (!selected) {
-		++acc.failed;
-		return;
-	}
-
-	for (const std::size_t idx : *selected) {
-		if (stop.stop_requested()) { // Ctrl-C between chapters: stop before the next fetch
-			break;
-		}
-		const MangaChapterInfo& ch = list[idx].item;
-		const std::filesystem::path dir = std::filesystem::path(dest) / utf8_path(chapter_dirname(ch, idx));
-		std::error_code ec;
-		std::filesystem::create_directories(dir, ec);
-
-		auto pages = coro::sync_wait(manga.chapter_pages(ctx, ch.ref(), GetFilters{}));
-		if (!pages) {
-			std::println(stderr, "{}: chapter {} pages failed: {}", program, idx + 1,
-			    pages.error().message);
-			++acc.failed;
-			continue;
-		}
-		auto& page_list = pages->results;
-		std::println("Chapter {} ({} pages)", ch.number.empty() ? std::to_string(idx + 1) : ch.number,
-		    page_list.size());
-		// Pages fan out (bounded by jobs); chapters stay sequential so their headers
-		// and per-chapter dirs don't interleave.
-		auto make_task = [&ctx, &acc, dir, json, &page_list](std::size_t i) {
-			return fetch_and_write(ctx, page_list[i].item.image, dir, page_list[i].offset, json, acc);
-		};
-		coro::sync_wait(for_each_concurrent(stop, page_list.size(), jobs, make_task));
-	}
-}
-
-int report(DumpResult result, const std::string& dest, bool json) {
-	if (json) {
-		boost::json::object o;
-		o["written"] = std::move(result.written);
-		o["ok"]      = result.ok;
-		o["failed"]  = result.failed;
-		std::println("{}", boost::json::serialize(boost::json::value(std::move(o))));
-	} else {
-		std::println("Downloaded {} file(s) to {}{}", result.ok, dest,
-		    result.failed > 0 ? std::format(" ({} failed)", result.failed) : std::string{});
-	}
-	return (result.ok == 0 && result.failed > 0) ? Runtime : Ok;
-}
-
-/// Rebuild a container from one piped {parser, handle} record (as emitted by
-/// search/latest --json) and dump it into @p acc via from_serialized.
-void dump_serialized(ParserStore& store, RequestorContext& ctx, const boost::json::object& record,
-                     const std::string& dest, GetFilters filters, std::string_view chapters_spec,
-                     bool json, DumpResult& acc, const std::stop_source& stop, unsigned jobs) {
-	const auto* parser_field = record.if_contains("parser");
-	const auto* handle_field = record.if_contains("handle");
-	if (!parser_field || !parser_field->is_string() || !handle_field || !handle_field->is_object()) {
-		std::println(stderr, "{}: skipping record without parser/handle", program);
-		++acc.failed;
-		return;
-	}
-	const std::string pid(parser_field->as_string().c_str());
-	const std::shared_ptr<Parser> parser = store.find_by_key(pid);
-	if (!parser) {
-		std::println(stderr, "{}: skipping unknown parser '{}'", program, pid);
-		++acc.failed;
-		return;
-	}
-	using namespace compatibilities_flags;
-	const CompatibilitiesFlags flags = parser->compatibilities().flags;
-	const bool is_images = flags.has(supports_images_store) || flags.has(supports_images_search);
-	const bool is_manga  = flags.has(supports_manga_store);
-	if (!is_images && !is_manga) {
-		std::println(stderr, "{}: skipping parser '{}' (no downloadable category)", program, pid);
-		++acc.failed;
-		return;
-	}
-
-	SerializedGetterData data;
-	const boost::json::object& handle = handle_field->as_object();
-	if (const auto* u = handle.if_contains("url"); u && u->is_string()) {
-		data.url = u->as_string().c_str();
-	}
-	if (const auto* p = handle.if_contains("params"); p && p->is_object()) {
-		for (const auto& [key, value] : p->as_object()) {
-			if (value.is_string()) {
-				data.params[std::string(key)] = value.as_string().c_str();
-			}
-		}
-	}
-
-	RequestorContext ready = ctx.new_with_config(parser->make_config(ctx.config()));
-	if (is_images) {
-		auto root = parser->images_getter();
-		auto getter = coro::sync_wait(root->from_serialized(std::move(data)));
-		if (!getter) {
-			std::println(stderr, "{}: from_serialized failed for '{}': {}", program, pid, getter.error().message);
-			++acc.failed;
-			return;
-		}
-		dump_container(ready, **getter, dest, filters, json, acc, stop, jobs);
-	} else {
-		auto root = parser->mangas_getter();
-		auto getter = coro::sync_wait(root->from_serialized(std::move(data)));
-		if (!getter) {
-			std::println(stderr, "{}: from_serialized failed for '{}': {}", program, pid, getter.error().message);
-			++acc.failed;
-			return;
-		}
-		dump_manga(ready, **getter, dest, chapters_spec, json, acc, stop, jobs);
-	}
-}
-
-int download(std::span<const std::string_view> args, bool json) {
-	// First positional (non-flag) token is the URL; skip the value-taking flags so
-	// their arguments aren't mistaken for it.
-	std::optional<std::string_view> url;
-	for (std::size_t i = 0; i < args.size(); ++i) {
-		const std::string_view a = args[i];
-		if (a == "--dest" || a == "--limit" || a == "--chapters" || a == "--delay" || a == "--jobs") {
-			++i; // consume the flag's value
-			continue;
-		}
-		if (a.starts_with('-')) {
-			continue;
-		}
-		url = a;
-		break;
-	}
-	std::string dest = ".";
-	if (const auto d = flag_value(args, "--dest")) {
-		dest = std::string(*d);
-	}
-	GetFilters filters; // default: every item of the container
-	if (const auto v = flag_value(args, "--limit")) {
-		const auto n = parse_uint(*v);
-		if (!n) {
-			std::println(stderr, "{}: --limit expects a non-negative integer", program);
-			return Usage;
-		}
-		filters.limit = static_cast<std::size_t>(*n);
-	}
-	std::string chapters_spec; // manga only; empty = all chapters
-	if (const auto c = flag_value(args, "--chapters")) {
-		chapters_spec = std::string(*c);
-	}
-	if (const auto d = flag_value(args, "--delay")) { // diagnostic: ms between image fetches
-		const auto n = parse_uint(*d);
-		if (!n) {
-			std::println(stderr, "{}: --delay expects a non-negative integer (milliseconds)", program);
-			return Usage;
-		}
-		g_delay_ms = static_cast<unsigned>(*n);
-	}
-	unsigned jobs = 1; // concurrent image fetches; 1 = sequential
-	if (const auto j = flag_value(args, "--jobs")) {
-		const auto n = parse_uint(*j);
-		if (!n || *n < 1) {
-			std::println(stderr, "{}: --jobs expects a positive integer", program);
-			return Usage;
-		}
-		jobs = static_cast<unsigned>(*n);
-	}
-	if (jobs > 1 && g_delay_ms != 0) {
-		// A blocking per-fetch sleep would stall the single requestor thread and
-		// serialize the workers; jobs is the throttle here, so drop the delay.
-		std::println(stderr, "{}: --delay ignored with --jobs > 1 (jobs bounds concurrency instead)", program);
-		g_delay_ms = 0;
-	}
-
-	// One stop_source for the whole download; SIGINT cancels every in-flight fetch.
-	std::stop_source stop;
-	SignalGuard signal_guard(stop);
-
-	ParserStore store;
-	populate_store(store);
-	auto client = std::make_shared<AsyncClient>();
-	RequestorContext ctx(client);
-
-	// URL mode: a pasted container / manga URL.
-	if (url) {
-		std::optional<UrlRoute> route = store.route_url(*url);
-		if (!route) {
-			std::println(stderr, "{}: no source handles '{}'", program, *url);
-			return Runtime;
-		}
-		RequestorContext ready = ctx.new_with_config(route->parser->make_config(ctx.config()));
-		DumpResult result;
-		if (route->type == GetterSuggestionType::Images) {
-			auto root = route->parser->images_getter();
-			auto getter = coro::sync_wait(root->parse_url(ready, std::move(route->url)));
-			if (!getter) {
-				std::println(stderr, "{}: parse failed: {}", program, getter.error().message);
-				return Runtime;
-			}
-			dump_container(ready, **getter, dest, filters, json, result, stop, jobs);
-		} else if (route->type == GetterSuggestionType::Manga) {
-			auto root = route->parser->mangas_getter();
-			auto getter = coro::sync_wait(root->parse_url(ready, std::move(route->url)));
-			if (!getter) {
-				std::println(stderr, "{}: parse failed: {}", program, getter.error().message);
-				return Runtime;
-			}
-			dump_manga(ready, **getter, dest, chapters_spec, json, result, stop, jobs);
-		} else {
-			std::println(stderr, "{}: download supports image and manga URLs", program);
-			return Usage;
-		}
-		return report(std::move(result), dest, json);
-	}
-
-	// stdin mode: consume the JSON that `search`/`latest --json` emits — records
-	// carrying {parser, handle} — and dump each via from_serialized. This is what
-	// closes `anip search --json | ... | anip download`.
-	std::string input((std::istreambuf_iterator<char>(std::cin)),
-	                  std::istreambuf_iterator<char>());
-	// Some shells (PowerShell) prepend a UTF-8 BOM when piping to a native stdin;
-	// strip it so the JSON parser sees a clean '['.
-	if (input.starts_with("\xEF\xBB\xBF")) {
-		input.erase(0, 3);
-	}
-	if (input.find_first_not_of(" \t\r\n") == std::string::npos) {
-		std::println(stderr, "{}: download needs a <url>, or JSON records on stdin", program);
-		return Usage;
-	}
-	boost::json::value doc;
-	try {
-		doc = boost::json::parse(input);
-	} catch (const std::exception& e) {
-		std::println(stderr, "{}: stdin is not valid JSON ({}).", program, e.what());
-		std::println(stderr, "{}: pipe search/latest with --json, e.g. "
-		    "`{} --json search -p X -q foo | {} download`", program, program, program);
-		return Usage;
-	}
-
-	DumpResult result;
-	if (doc.is_array()) {
-		for (const auto& v : doc.as_array()) {
-			if (v.is_object()) {
-				dump_serialized(store, ctx, v.as_object(), dest, filters, chapters_spec, json, result, stop, jobs);
-			}
-		}
-	} else if (doc.is_object()) {
-		dump_serialized(store, ctx, doc.as_object(), dest, filters, chapters_spec, json, result, stop, jobs);
-	} else {
-		std::println(stderr, "{}: stdin JSON must be an object or array of records", program);
-		return Usage;
-	}
-	return report(std::move(result), dest, json);
-}
-
 int real_main(std::span<const std::string_view> args) {
 	// Split a single global flag (--json) from the verb + its arguments. --help
 	// anywhere shows help and exits 0.
@@ -1407,7 +554,7 @@ int real_main(std::span<const std::string_view> args) {
 	std::println(stderr, "{}: unknown command '{}'", program, verb);
 	return usage();
 }
-} // namespace
+} // namespace anip::cli
 
 int main(int argc, const char** argv) {
 	std::vector<std::string_view> args;
@@ -1417,14 +564,14 @@ int main(int argc, const char** argv) {
 	}
 
 	try {
-		return real_main(args);
+		return anip::cli::real_main(args);
 	}
 	catch (const std::exception& e) {
-		std::println(stderr, "{}: error: {}", program, e.what());
-		return Runtime;
+		std::println(stderr, "{}: error: {}", anip::cli::program, e.what());
+		return anip::cli::Runtime;
 	}
 	catch (...) {
-		std::println(stderr, "{}: unknown error", program);
-		return Runtime;
+		std::println(stderr, "{}: unknown error", anip::cli::program);
+		return anip::cli::Runtime;
 	}
 }

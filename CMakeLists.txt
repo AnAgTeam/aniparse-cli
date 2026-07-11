@@ -60,6 +60,8 @@ configure_file(
 
 add_executable(anip
 	"src/main.cpp"
+	"src/CliFilters.cpp"
+	"src/CliDownload.cpp"
 )
 
 set_property(TARGET anip PROPERTY CXX_STANDARD 23)
