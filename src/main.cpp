@@ -22,8 +22,10 @@
 #include <boost/json.hpp>
 #include <coro/sync_wait.hpp>
 
+#include <cctype>
 #include <charconv>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <print>
@@ -32,7 +34,7 @@
 #include <string_view>
 #include <vector>
 
-namespace anip::cli {
+namespace aniparse::cli {
 using namespace aniparse;
 
 int usage() {
@@ -50,6 +52,12 @@ int usage() {
 	    "  download [<url>] [--dest DIR] [--limit N] [--chapters 1-4,8] [--jobs N] [--delay MS]  save files\n"
 	    "                          (image container, or manga chapters->pages;\n"
 	    "                           no <url>: read search/latest --json records from stdin)\n"
+	    "\n"
+	    "Auth (search/latest/parse/download — a source that needs credentials):\n"
+	    "  --token T               token login    (or env ANIP_<PARSER>_TOKEN)\n"
+	    "  --user U --password P   user/pass login (or env ANIP_<PARSER>_USER / _PASSWORD)\n"
+	    "                          <PARSER> = the id upper-cased, e.g. ANIP_GELBOORU_USER;\n"
+	    "                          env keeps secrets out of argv. Gelbooru: user=user_id, password=api_key\n"
 	    "\n"
 	    "Global:\n"
 	    "  --json   emit machine-readable JSON instead of human text\n"
@@ -85,7 +93,87 @@ std::string join(const std::vector<std::string_view>& parts, std::string_view se
 
 void populate_store(ParserStore& store) {
 	parsers::emplace_default_parsers(store);
-	anip::register_extensions(store);
+	register_extensions(store); // aniparse::cli::register_extensions (generated seam A)
+}
+
+/// The value of ANIP_<PARSER>_<suffix> (parser id upper-cased), or nullopt. The env
+/// is the secret-safe channel: unlike --user/--token it never lands in argv or the
+/// shell history.
+std::optional<std::string> auth_env(std::string_view parser_id, std::string_view suffix) {
+	std::string name = "ANIP_";
+	for (const char c : parser_id) {
+		name += static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+	}
+	name += '_';
+	name += suffix;
+#ifdef _MSC_VER
+#	pragma warning(push)
+#	pragma warning(disable : 4996) // std::getenv is the portable read; no writes, safe here
+#endif
+	if (const char* v = std::getenv(name.c_str())) {
+		return std::string(v);
+	}
+#ifdef _MSC_VER
+#	pragma warning(pop)
+#endif
+	return std::nullopt;
+}
+
+std::optional<AuthenticationData> resolve_credentials(std::string_view parser_id,
+                                                      std::span<const std::string_view> args) {
+	// A token wins outright when present (flag over env).
+	std::optional<std::string> token;
+	if (const auto t = flag_value(args, "--token")) {
+		token = std::string(*t);
+	} else {
+		token = auth_env(parser_id, "TOKEN");
+	}
+	if (token) {
+		return AuthenticationToken{ .token = std::move(*token), .type = {} };
+	}
+
+	// Otherwise a user/password pair (each flag falls back to its env var).
+	std::optional<std::string> user;
+	if (const auto u = flag_value(args, "--user")) {
+		user = std::string(*u);
+	} else {
+		user = auth_env(parser_id, "USER");
+	}
+	std::optional<std::string> password;
+	if (const auto p = flag_value(args, "--password")) {
+		password = std::string(*p);
+	} else {
+		password = auth_env(parser_id, "PASSWORD");
+	}
+	if (user && password) {
+		return AuthenticationUserPassword{ .username = std::move(*user), .password = std::move(*password) };
+	}
+	if (user || password) {
+		std::println(stderr, "{}: both --user and --password (or ANIP_{}_USER/_PASSWORD) are required "
+		    "— continuing unauthenticated", program, "<PARSER>");
+	}
+	return std::nullopt;
+}
+
+std::optional<RequestorContext> make_ready_context(const RequestorContext& base, Parser& parser,
+                                                   std::span<const std::string_view> args) {
+	// Always derive the parser's own config first (parser identity + defaults).
+	RequestorContext ready = base.new_with_config(parser.make_config(base.config()));
+
+	std::optional<AuthenticationData> creds = resolve_credentials(parser.identifier(), args);
+	if (!creds) {
+		return ready; // anonymous — no credentials supplied
+	}
+
+	// authenticate_context returns a FRESH const config and leaves `ready` untouched;
+	// adopt it by copying into a mutable config (new_with_config wants a non-const one).
+	auto authed = coro::sync_wait(parser.authenticate_context(ready, std::move(*creds)));
+	if (!authed) {
+		std::println(stderr, "{}: authentication failed for '{}': {}", program,
+		    parser.identifier(), authed.error().message);
+		return std::nullopt;
+	}
+	return ready.new_with_config(std::make_shared<ParserConfig>(**authed));
 }
 
 int list_parsers(bool json) {
@@ -299,7 +387,11 @@ int latest(std::span<const std::string_view> args, bool json) {
 
 	auto client = std::make_shared<AsyncClient>();
 	RequestorContext ctx(client);
-	RequestorContext ready = ctx.new_with_config(parser->make_config(ctx.config()));
+	auto ready_opt = make_ready_context(ctx, *parser, args);
+	if (!ready_opt) {
+		return Runtime;
+	}
+	RequestorContext ready = std::move(*ready_opt);
 
 	using namespace compatibilities_flags;
 	const CompatibilitiesFlags flags = parser->compatibilities().flags;
@@ -342,7 +434,11 @@ int search(std::span<const std::string_view> args, bool json) {
 
 	auto client = std::make_shared<AsyncClient>();
 	RequestorContext ctx(client);
-	RequestorContext ready = ctx.new_with_config(parser->make_config(ctx.config()));
+	auto ready_opt = make_ready_context(ctx, *parser, args);
+	if (!ready_opt) {
+		return Runtime;
+	}
+	RequestorContext ready = std::move(*ready_opt);
 
 	const std::string_view q = query.value_or(std::string_view{});
 	using namespace compatibilities_flags;
@@ -404,11 +500,17 @@ int emit_parsed(RequestorContext& ctx, GetterPtr getter, std::string_view source
 
 int parse_verb(std::span<const std::string_view> args, bool json) {
 	std::optional<std::string_view> url;
-	for (const std::string_view a : args) {
-		if (!a.starts_with('-')) {
-			url = a;
-			break;
+	for (std::size_t i = 0; i < args.size(); ++i) {
+		const std::string_view a = args[i];
+		if (a == "--token" || a == "--user" || a == "--password") {
+			++i; // skip the flag's value so it isn't mistaken for the URL
+			continue;
 		}
+		if (a.starts_with('-')) {
+			continue;
+		}
+		url = a;
+		break;
 	}
 	if (!url) {
 		std::println(stderr, "{}: parse needs a <url>", program);
@@ -426,7 +528,11 @@ int parse_verb(std::span<const std::string_view> args, bool json) {
 
 	auto client = std::make_shared<AsyncClient>();
 	RequestorContext ctx(client);
-	RequestorContext ready = ctx.new_with_config(route->parser->make_config(ctx.config()));
+	auto ready_opt = make_ready_context(ctx, *route->parser, args);
+	if (!ready_opt) {
+		return Runtime;
+	}
+	RequestorContext ready = std::move(*ready_opt);
 	const std::string source = route->parser->info().name;
 
 	// route->url is consumed by parse_url; keep the root getter in a named local so
@@ -488,7 +594,11 @@ int support(std::span<const std::string_view> args, bool json) {
 
 	auto client = std::make_shared<AsyncClient>();
 	RequestorContext ctx(client);
-	RequestorContext ready = ctx.new_with_config(parser->make_config(ctx.config()));
+	auto ready_opt = make_ready_context(ctx, *parser, args);
+	if (!ready_opt) {
+		return Runtime;
+	}
+	RequestorContext ready = std::move(*ready_opt);
 
 	using namespace compatibilities_flags;
 	const CompatibilitiesFlags pflags = parser->compatibilities().flags;
@@ -554,7 +664,7 @@ int real_main(std::span<const std::string_view> args) {
 	std::println(stderr, "{}: unknown command '{}'", program, verb);
 	return usage();
 }
-} // namespace anip::cli
+} // namespace aniparse::cli
 
 int main(int argc, const char** argv) {
 	std::vector<std::string_view> args;
@@ -564,14 +674,14 @@ int main(int argc, const char** argv) {
 	}
 
 	try {
-		return anip::cli::real_main(args);
+		return aniparse::cli::real_main(args);
 	}
 	catch (const std::exception& e) {
-		std::println(stderr, "{}: error: {}", anip::cli::program, e.what());
-		return anip::cli::Runtime;
+		std::println(stderr, "{}: error: {}", aniparse::cli::program, e.what());
+		return aniparse::cli::Runtime;
 	}
 	catch (...) {
-		std::println(stderr, "{}: unknown error", anip::cli::program);
-		return anip::cli::Runtime;
+		std::println(stderr, "{}: unknown error", aniparse::cli::program);
+		return aniparse::cli::Runtime;
 	}
 }

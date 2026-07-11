@@ -13,7 +13,9 @@
  */
 #pragma once
 #include <aniparse/ParserStore.hpp>
+#include <aniparse/ClientContext.hpp>
 #include <aniparse/types/Search.hpp>
+#include <aniparse/types/Authentication.hpp>
 
 #include <optional>
 #include <span>
@@ -21,7 +23,7 @@
 #include <string_view>
 #include <vector>
 
-namespace anip::cli {
+namespace aniparse::cli {
 
 inline constexpr std::string_view program = "anip";
 
@@ -47,6 +49,27 @@ std::vector<std::string_view> capability_labels(const aniparse::CompatibilitiesF
 /// linked into this build (seam A — see cmake/anip_extensions.hpp.in).
 void populate_store(aniparse::ParserStore& store);
 
+// --- Authentication (defined in main.cpp) ---
+
+/// Resolve credentials for @p parser_id from the shared auth flags, falling back to
+/// environment variables so secrets need not appear in argv / shell history:
+///   --token T            or  ANIP_<PARSER>_TOKEN            -> AuthenticationToken
+///   --user U --password P or  ANIP_<PARSER>_USER/_PASSWORD  -> AuthenticationUserPassword
+/// where <PARSER> is the parser identifier upper-cased (e.g. ANIP_GELBOORU_USER).
+/// Flags win over the environment. nullopt = no credentials supplied (run anonymous);
+/// a lone half of a user/password pair is reported as an error via the returned flag.
+std::optional<aniparse::AuthenticationData> resolve_credentials(
+    std::string_view parser_id, std::span<const std::string_view> args);
+
+/// Derive @p parser's config from @p base and, when credentials are supplied,
+/// authenticate it — returning the RequestorContext every getter then runs on.
+/// The single seam that folds make_config + optional authenticate_context. Prints
+/// and returns nullopt only when an actual authentication attempt fails; with no
+/// credentials it returns the (anonymous) derived context.
+std::optional<aniparse::RequestorContext> make_ready_context(
+    const aniparse::RequestorContext& base, aniparse::Parser& parser,
+    std::span<const std::string_view> args);
+
 // --- Filter vocabulary (defined in cli_filters.cpp) ---
 
 /// Build structured search filters from repeated `--filter k=v` (v may be `!x` to
@@ -68,4 +91,4 @@ int print_latest_support(std::string_view source, std::string_view category,
 
 int download(std::span<const std::string_view> args, bool json);
 
-} // namespace anip::cli
+} // namespace aniparse::cli

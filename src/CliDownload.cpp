@@ -35,7 +35,7 @@
 #include <thread>
 #include <vector>
 
-namespace anip::cli {
+namespace aniparse::cli {
 using namespace aniparse;
 
 namespace {
@@ -343,7 +343,8 @@ int report(DumpResult result, const std::string& dest, bool json) {
 /// search/latest --json) and dump it into @p acc via from_serialized.
 void dump_serialized(ParserStore& store, RequestorContext& ctx, const boost::json::object& record,
                      const std::string& dest, GetFilters filters, std::string_view chapters_spec,
-                     bool json, DumpResult& acc, const std::stop_source& stop, unsigned jobs) {
+                     bool json, DumpResult& acc, const std::stop_source& stop, unsigned jobs,
+                     std::span<const std::string_view> args) {
 	const auto* parser_field = record.if_contains("parser");
 	const auto* handle_field = record.if_contains("handle");
 	if (!parser_field || !parser_field->is_string() || !handle_field || !handle_field->is_object()) {
@@ -381,7 +382,12 @@ void dump_serialized(ParserStore& store, RequestorContext& ctx, const boost::jso
 		}
 	}
 
-	RequestorContext ready = ctx.new_with_config(parser->make_config(ctx.config()));
+	auto ready_opt = make_ready_context(ctx, *parser, args);
+	if (!ready_opt) {
+		++acc.failed;
+		return;
+	}
+	RequestorContext ready = std::move(*ready_opt);
 	if (is_images) {
 		auto root = parser->images_getter();
 		auto getter = coro::sync_wait(root->from_serialized(std::move(data)));
@@ -411,7 +417,8 @@ int download(std::span<const std::string_view> args, bool json) {
 	std::optional<std::string_view> url;
 	for (std::size_t i = 0; i < args.size(); ++i) {
 		const std::string_view a = args[i];
-		if (a == "--dest" || a == "--limit" || a == "--chapters" || a == "--delay" || a == "--jobs") {
+		if (a == "--dest" || a == "--limit" || a == "--chapters" || a == "--delay" || a == "--jobs"
+		 || a == "--token" || a == "--user" || a == "--password") {
 			++i; // consume the flag's value
 			continue;
 		}
@@ -478,7 +485,11 @@ int download(std::span<const std::string_view> args, bool json) {
 			std::println(stderr, "{}: no source handles '{}'", program, *url);
 			return Runtime;
 		}
-		RequestorContext ready = ctx.new_with_config(route->parser->make_config(ctx.config()));
+		auto ready_opt = make_ready_context(ctx, *route->parser, args);
+		if (!ready_opt) {
+			return Runtime;
+		}
+		RequestorContext ready = std::move(*ready_opt);
 		DumpResult result;
 		if (route->type == GetterSuggestionType::Images) {
 			auto root = route->parser->images_getter();
@@ -531,11 +542,11 @@ int download(std::span<const std::string_view> args, bool json) {
 	if (doc.is_array()) {
 		for (const auto& v : doc.as_array()) {
 			if (v.is_object()) {
-				dump_serialized(store, ctx, v.as_object(), dest, filters, chapters_spec, json, result, stop, jobs);
+				dump_serialized(store, ctx, v.as_object(), dest, filters, chapters_spec, json, result, stop, jobs, args);
 			}
 		}
 	} else if (doc.is_object()) {
-		dump_serialized(store, ctx, doc.as_object(), dest, filters, chapters_spec, json, result, stop, jobs);
+		dump_serialized(store, ctx, doc.as_object(), dest, filters, chapters_spec, json, result, stop, jobs, args);
 	} else {
 		std::println(stderr, "{}: stdin JSON must be an object or array of records", program);
 		return Usage;
@@ -543,4 +554,4 @@ int download(std::span<const std::string_view> args, bool json) {
 	return report(std::move(result), dest, json);
 }
 
-} // namespace anip::cli
+} // namespace aniparse::cli

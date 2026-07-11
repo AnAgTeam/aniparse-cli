@@ -10,11 +10,11 @@
 #pragma once
 #include <aniparse/ParserStore.hpp>
 @ANIP_EXTENSION_INCLUDES@
-namespace anip {
+namespace aniparse::cli {
 
 /// Register every extension parser set linked into this build, after the
 /// default showcase set. A no-op when no extensions were configured.
 inline void register_extensions([[maybe_unused]] aniparse::ParserStore& store) {
 @ANIP_EXTENSION_CALLS@}
 
-} // namespace anip
+} // namespace aniparse::cli

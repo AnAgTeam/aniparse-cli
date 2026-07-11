@@ -18,7 +18,7 @@
 #include <variant>
 #include <vector>
 
-namespace anip::cli {
+namespace aniparse::cli {
 using namespace aniparse;
 
 namespace {
@@ -351,4 +351,4 @@ int print_latest_support(std::string_view source, std::string_view category,
 	return Ok;
 }
 
-} // namespace anip::cli
+} // namespace aniparse::cli
