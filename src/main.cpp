@@ -323,6 +323,8 @@ std::optional<SearchItems> build_search_filters(std::span<const std::string_view
 		if (std::holds_alternative<TextQuery>(type)) {
 			out[key] = TextQuery{ .text = std::string(val), .exclusive = exclusive };
 		} else if (std::holds_alternative<ItemSelection>(type)) {
+			// Just accumulate the token; membership (for enumerated axes) and exclusion
+			// support are validated centrally by validate_query in run_search.
 			auto it = out.find(key);
 			if (it == out.end()) {
 				it = out.emplace(key, ItemSelection{}).first;
@@ -410,10 +412,6 @@ int run_search(RequestorContext& ready, Root& root, std::string_view query,
 		std::println(stderr, "{}: search_support failed: {}", program, support.error().message);
 		return Runtime;
 	}
-	// build_search_filters checks each key against the support table (the useful
-	// pre-flight). Full membership validation is skipped on purpose: open-vocabulary
-	// sources declare an axis with no enumerated options, which validate_query would
-	// wrongly reject.
 	std::optional<SearchItems> structured = build_search_filters(args, support->supported_filters);
 	if (!structured) {
 		return Usage;
@@ -422,6 +420,14 @@ int run_search(RequestorContext& ready, Root& root, std::string_view query,
 	SearchRequestQuery request;
 	request.query   = std::string(query);
 	request.filters = std::move(*structured);
+
+	// Central pre-flight before any network: unknown/type-mismatched filters,
+	// unsupported exclusion, out-of-set selection tokens (an empty support selection
+	// is open vocabulary and accepts any token), and the sort key/direction.
+	if (auto errors = validate_query(*support, request, filters); !errors.empty()) {
+		std::println(stderr, "{}: {}", program, describe_search_query_errors(errors));
+		return Usage;
+	}
 	return emit_page(ready, coro::sync_wait(root.search(ready, request, filters)), parser_id, json);
 }
 
@@ -654,6 +660,55 @@ int list_filters(bool json) {
 	return Ok;
 }
 
+/// The declared type of one filter as a short token — shared by the human and JSON
+/// `support search` output so they never drift.
+std::string_view filter_type_name(const SearchItemVariant& value) {
+	if (std::holds_alternative<ItemSelection>(value))         { return "selection"; }
+	if (std::holds_alternative<TextQuery>(value))             { return "text"; }
+	if (std::holds_alternative<IntInterval>(value))           { return "int"; }
+	if (std::holds_alternative<Checkmark>(value))             { return "flag"; }
+	if (std::holds_alternative<TimeInterval>(value))          { return "time"; }
+	if (std::holds_alternative<RelativeTimeInterval>(value))  { return "rel-time"; }
+	return "unknown";
+}
+
+/// Up to @p max "label(token)" samples from an enumerated selection, then a
+/// "… (N total)" tail. The value the user types is the token (the map key); the
+/// label is what the source shows for it.
+std::string selection_sample(const ItemSelection& selection, std::size_t max = 6) {
+	std::string out;
+	std::size_t i = 0;
+	for (const auto& [token, value] : selection) {
+		if (i >= max) {
+			out += std::format(" … ({} total)", selection.size());
+			break;
+		}
+		if (i) {
+			out += ", ";
+		}
+		out += value.name.empty() ? std::string(token) : std::format("{}({})", value.name, token);
+		++i;
+	}
+	return out;
+}
+
+/// The SOURCE-SPECIFIC detail for one filter — what `list filters` cannot show: the
+/// options to choose from for an enumerated selection, or that it is open-vocabulary
+/// / free text. The value-writing syntax by type lives in `list filters`, so it is
+/// deliberately NOT repeated here.
+std::string filter_detail(const SearchItemVariant& value) {
+	if (const auto* selection = std::get_if<ItemSelection>(&value)) {
+		if (selection->empty()) {
+			return "open vocabulary — any token";
+		}
+		return std::format("from: {}", selection_sample(*selection));
+	}
+	if (std::holds_alternative<TextQuery>(value)) {
+		return "any text";
+	}
+	return {}; // int / flag / time: the type name + `list filters` syntax is enough
+}
+
 std::string sort_directions(const SortDescriptor& d) {
 	std::string out;
 	if (d.ascending) {
@@ -673,7 +728,22 @@ int print_search_support(std::string_view source, std::string_view category,
 	if (json) {
 		boost::json::array filters;
 		for (const auto& [key, value] : sc.supported_filters) {
-			filters.emplace_back(key);
+			boost::json::object f;
+			f["key"]  = key;
+			f["type"] = std::string(filter_type_name(value));
+			// Enumerated options only: an empty selection is open-vocabulary and has
+			// none to list. Token is what --filter takes; label is the display name.
+			if (const auto* selection = std::get_if<ItemSelection>(&value); selection && !selection->empty()) {
+				boost::json::array options;
+				for (const auto& [token, opt] : *selection) {
+					boost::json::object o;
+					o["token"] = token;
+					o["label"] = opt.name;
+					options.push_back(std::move(o));
+				}
+				f["options"] = std::move(options);
+			}
+			filters.push_back(std::move(f));
 		}
 		boost::json::array sorts;
 		for (const auto& [key, dir] : sc.supported_sorts) {
@@ -706,11 +776,11 @@ int print_search_support(std::string_view source, std::string_view category,
 	if (sc.supported_filters.empty()) {
 		std::println("Filters: (free-text query only)");
 	} else {
-		std::vector<std::string_view> keys;
+		std::println("Filters: (prefix a value with '!' to exclude; different keys = AND; "
+		             "value syntax: {} list filters)", program);
 		for (const auto& [key, value] : sc.supported_filters) {
-			keys.push_back(key);
+			std::println("  {:<10} {:<9} {}", key, filter_type_name(value), filter_detail(value));
 		}
-		std::println("Filters: {}", join(keys, ", "));
 	}
 	if (sc.supported_sorts.empty()) {
 		std::println("Sorts:   (source default only)");
