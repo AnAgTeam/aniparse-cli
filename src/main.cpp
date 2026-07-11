@@ -37,6 +37,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <variant>
 #include <vector>
 
 namespace {
@@ -84,10 +85,11 @@ int usage() {
 	    "\n"
 	    "Commands:\n"
 	    "  list parsers            list the available sources\n"
-	    "  list filters            list the library's search-filter vocabulary\n"
+	    "  list filters            search-filter vocabulary + --filter value syntax\n"
 	    "  support (latest|search) -p <parser>   show what a source supports\n"
 	    "  latest -p <parser> [--from N] [--limit N] [--sort KEY] [--asc]\n"
-	    "  search -p <parser> -q <query> [--filter k=v ...] [--from N] [--limit N]\n"
+	    "  search -p <parser> [-q <query>] [--filter k=v ...] [--from N] [--limit N]\n"
+	    "                          (--filter repeatable; k=!v excludes; needs -q or --filter)\n"
 	    "  parse <url>             route a URL to its source and fetch info\n"
 	    "  download [<url>] [--dest DIR] [--limit N] [--chapters 1-4,8] [--jobs N] [--delay MS]  save files\n"
 	    "                          (image container, or manga chapters->pages;\n"
@@ -244,6 +246,106 @@ std::optional<GetFilters> parse_filters(std::span<const std::string_view> args) 
 	return filters;
 }
 
+/// Parse an int filter value: "N" (exact), "A-B" (range), "A-" (min), "-B" (max).
+std::optional<IntInterval> parse_int_interval(std::string_view v, bool exclusive) {
+	IntInterval interval;
+	interval.exclusive = exclusive;
+	auto to_num = [](std::string_view s) -> std::optional<std::ptrdiff_t> {
+		const auto n = parse_uint(s);
+		return n ? std::optional<std::ptrdiff_t>(static_cast<std::ptrdiff_t>(*n)) : std::nullopt;
+	};
+	const std::size_t dash = v.find('-');
+	if (dash == std::string_view::npos) {
+		const auto n = to_num(v);
+		if (!n) {
+			return std::nullopt;
+		}
+		interval.from = *n;
+		interval.to   = *n;
+		return interval;
+	}
+	const std::string_view lo = v.substr(0, dash);
+	const std::string_view hi = v.substr(dash + 1);
+	if (lo.empty() && hi.empty()) {
+		return std::nullopt;
+	}
+	if (!lo.empty()) {
+		const auto n = to_num(lo);
+		if (!n) {
+			return std::nullopt;
+		}
+		interval.from = *n;
+	}
+	if (!hi.empty()) {
+		const auto n = to_num(hi);
+		if (!n) {
+			return std::nullopt;
+		}
+		interval.to = *n;
+	}
+	return interval;
+}
+
+/// Build structured search filters from repeated `--filter k=v` (v may be `!x` to
+/// exclude), typed against the source's declared @p supported table: the variant
+/// alternative each key declares (TextQuery / ItemSelection / IntInterval /
+/// Checkmark) drives how the value is parsed. Repeated ItemSelection keys accumulate
+/// (multi-tag AND). Prints and returns nullopt on an unknown key or malformed value.
+std::optional<SearchItems> build_search_filters(std::span<const std::string_view> args,
+                                                const SearchItems& supported) {
+	SearchItems out;
+	for (std::size_t i = 0; i + 1 < args.size(); ++i) {
+		if (args[i] != "--filter") {
+			continue;
+		}
+		const std::string_view kv = args[i + 1];
+		const std::size_t eq = kv.find('=');
+		if (eq == std::string_view::npos) {
+			std::println(stderr, "{}: --filter expects k=v (got '{}')", program, kv);
+			return std::nullopt;
+		}
+		const std::string key = std::string(kv.substr(0, eq));
+		std::string_view    val = kv.substr(eq + 1);
+		bool exclusive = false;
+		if (!val.empty() && val.front() == '!') {
+			exclusive = true;
+			val.remove_prefix(1);
+		}
+
+		const auto decl = supported.find(key);
+		if (decl == supported.end()) {
+			std::println(stderr, "{}: unknown filter '{}' for this source (try `{} support search -p <parser>`)",
+			             program, key, program);
+			return std::nullopt;
+		}
+
+		const SearchItemVariant& type = decl->second;
+		if (std::holds_alternative<TextQuery>(type)) {
+			out[key] = TextQuery{ .text = std::string(val), .exclusive = exclusive };
+		} else if (std::holds_alternative<ItemSelection>(type)) {
+			auto it = out.find(key);
+			if (it == out.end()) {
+				it = out.emplace(key, ItemSelection{}).first;
+			}
+			std::get<ItemSelection>(it->second)[std::string(val)] =
+			    ItemSelectionValue{ .name = std::string(val), .exclusive = exclusive };
+		} else if (std::holds_alternative<IntInterval>(type)) {
+			const auto interval = parse_int_interval(val, exclusive);
+			if (!interval) {
+				std::println(stderr, "{}: --filter {} expects a number or range a-b", program, key);
+				return std::nullopt;
+			}
+			out[key] = *interval;
+		} else if (std::holds_alternative<Checkmark>(type)) {
+			out[key] = Checkmark{ .exclusive = exclusive };
+		} else {
+			std::println(stderr, "{}: --filter {} has a type this CLI can't express yet", program, key);
+			return std::nullopt;
+		}
+	}
+	return out;
+}
+
 /// Print a fetched page of container getters (shared by latest and search).
 /// Templated over the awaited result so one body serves both manga and images:
 /// latest()/search() return the same PageResults<unique_ptr<...>> and both leaf
@@ -296,6 +398,33 @@ int emit_page(RequestorContext& ctx, PageResult page, std::string_view parser_id
 	return Ok;
 }
 
+/// Run a search on @p root (manga or images): fetch its declared support, build the
+/// structured --filter set typed against it, and emit the page. Templated so one
+/// body serves both root getter kinds (both expose search_support + search).
+template <typename Root>
+int run_search(RequestorContext& ready, Root& root, std::string_view query,
+               std::span<const std::string_view> args, const GetFilters& filters,
+               std::string_view parser_id, bool json) {
+	auto support = coro::sync_wait(root.search_support(ready));
+	if (!support) {
+		std::println(stderr, "{}: search_support failed: {}", program, support.error().message);
+		return Runtime;
+	}
+	// build_search_filters checks each key against the support table (the useful
+	// pre-flight). Full membership validation is skipped on purpose: open-vocabulary
+	// sources declare an axis with no enumerated options, which validate_query would
+	// wrongly reject.
+	std::optional<SearchItems> structured = build_search_filters(args, support->supported_filters);
+	if (!structured) {
+		return Usage;
+	}
+
+	SearchRequestQuery request;
+	request.query   = std::string(query);
+	request.filters = std::move(*structured);
+	return emit_page(ready, coro::sync_wait(root.search(ready, request, filters)), parser_id, json);
+}
+
 int latest(std::span<const std::string_view> args, bool json) {
 	const std::optional<std::string_view> pkey = flag_value(args, "-p");
 	if (!pkey) {
@@ -341,8 +470,9 @@ int search(std::span<const std::string_view> args, bool json) {
 		return Usage;
 	}
 	const std::optional<std::string_view> query = flag_value(args, "-q");
-	if (!query) {
-		std::println(stderr, "{}: search needs -q <query>", program);
+	const bool has_filter = has_flag(args, "--filter");
+	if (!query && !has_filter) {
+		std::println(stderr, "{}: search needs -q <query> or --filter k=v", program);
 		return Usage;
 	}
 	const std::optional<GetFilters> filters = parse_filters(args);
@@ -362,20 +492,16 @@ int search(std::span<const std::string_view> args, bool json) {
 	RequestorContext ctx(client);
 	RequestorContext ready = ctx.new_with_config(parser->make_config(ctx.config()));
 
-	// Free-text query only for now; structured --filter k=v needs the SearchItems
-	// (SearchItemVariant) builder and is deferred.
-	SearchRequestQuery request;
-	request.query = std::string(*query);
-
+	const std::string_view q = query.value_or(std::string_view{});
 	using namespace compatibilities_flags;
 	const CompatibilitiesFlags flags = parser->compatibilities().flags;
 	if (flags.has(supports_manga_store)) {
 		auto root = parser->mangas_getter();
-		return emit_page(ready, coro::sync_wait(root->search(ready, request, *filters)), parser->identifier(), json);
+		return run_search(ready, *root, q, args, *filters, parser->identifier(), json);
 	}
 	if (flags.has(supports_images_search)) {
 		auto root = parser->images_getter();
-		return emit_page(ready, coro::sync_wait(root->search(ready, request, *filters)), parser->identifier(), json);
+		return run_search(ready, *root, q, args, *filters, parser->identifier(), json);
 	}
 	std::println(stderr, "{}: parser '{}' does not support search", program, *pkey);
 	return Usage;
@@ -515,7 +641,16 @@ int list_filters(bool json) {
 	for (const Key& k : keys) {
 		std::println("  {:<10} {}", k.key, k.about);
 	}
-	std::println("\nWhich a source actually accepts: {} support search -p <parser>", program);
+
+	std::println("\n--filter k=v value syntax (a source declares each key's type):");
+	std::println("  ItemSelection  k=token     repeatable = AND    e.g. --filter tag=a --filter tag=b");
+	std::println("  TextQuery      k=text                          e.g. --filter title=naruto");
+	std::println("  IntInterval    k=N | A-B | A- | -B             e.g. --filter icount=20-50");
+	std::println("  Checkmark      k=1          (any value enables the flag)");
+	std::println("  exclude (NOT)  prefix the value with '!'       e.g. --filter tag=!guro");
+	std::println("  combine        different keys = AND across axes; needs -q or --filter");
+
+	std::println("\nWhich keys (and types) a source accepts: {} support search -p <parser>", program);
 	return Ok;
 }
 
