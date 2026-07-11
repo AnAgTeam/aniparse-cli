@@ -2,6 +2,7 @@
 	"name": "aniparse-cli",
 	"version": "0.1",
 	"dependencies": [
+		"boost-hash2",
 		"boost-json",
 		"boost-regex",
 		"boost-system",
