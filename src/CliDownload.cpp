@@ -8,7 +8,7 @@
  */
 #include "CliCommon.hpp"
 
-#include <aniparse/Client.hpp>
+#include <aniparse/net/Client.hpp>
 #include <aniparse/net/CancellingTask.hpp> // asyncnet::NetworkTask (backend-neutral)
 
 #include <boost/json.hpp>

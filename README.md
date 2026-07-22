@@ -15,7 +15,7 @@ pair.
 ```
 aniparse-cli/
 ├── src/
-│   ├── main.cpp          verb dispatch + search/latest/support/parse + shared helpers
+│   ├── main.cpp          verb dispatch + search/latest/support/parse/episodes + shared helpers
 │   ├── CliCommon.hpp     internal shared surface (namespace aniparse::cli)
 │   ├── CliFilters.cpp    --filter vocabulary + `list filters` / `support` output
 │   └── CliDownload.cpp   the download verb and its image/manga dumping
@@ -67,9 +67,10 @@ opt-in C entry point over this same registrar seam.
 | `list parsers` | the available sources and their capabilities |
 | `list filters` | the search-filter vocabulary and `--filter k=v` value syntax |
 | `support (latest\|search) -p <parser>` | what a source accepts: filters, sorts, flags |
-| `latest -p <parser> [--from N] [--limit N] [--sort S] [--asc]` | browse the newest items |
-| `search -p <parser> [-q <query>] [--filter k=v ...] [--from N] [--limit N]` | search a source |
-| `parse <url>` | route a URL to its source and fetch info |
+| `latest -p <parser> [--from N] [--limit N] [--sort S] [--asc]` | browse the newest manga, anime, or images |
+| `search -p <parser> [-q <query>] [--filter k=v ...] [--from N] [--limit N]` | search a source catalogue |
+| `parse <url>` / `parse -` | fetch a routed URL, or full info for search/latest JSON read from stdin |
+| `episodes <url> [--track ID] [--episode N] [--limit N]` | inspect an anime's tracks, episodes, or advertised playback sources |
 | `download [<url>] [--dest DIR] [--chapters 1-4,8] [--jobs N]` | save files |
 
 `search` takes `-q` and/or repeatable `--filter k=v` (`k=!v` excludes; different keys
@@ -125,6 +126,14 @@ anip latest -p AniList --limit 10
 
 # route any URL to whichever source owns it
 anip parse "https://anilist.co/manga/30002"
+
+# turn opaque search handles directly into full cards
+anip --json search -p AniList -q "chainsaw man" --limit 2 | anip parse -
+
+# inspect an anime source's playback hierarchy (metadata only: no media download)
+anip episodes "<anime-url>"                         # available tracks, when the source has them
+anip episodes "<anime-url>" --track 123 --limit 10   # episodes on one track
+anip episodes "<anime-url>" --track 123 --episode 1  # advertised player/source for episode 1
 
 # machine-readable output, post-processed with jq (metadata, no download)
 anip --json search -p AniList -q naruto --limit 3 | jq -r '.[].title'
