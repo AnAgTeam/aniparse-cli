@@ -35,24 +35,31 @@ cmake --build out/build/x64-debug
 
 The public binary ships only the showcase parsers. To build your own `anip` with
 extra (e.g. private) sources, point it at an extension library that exposes a
-registrar `void reg(aniparse::ParserStore&)`. This is **static composition** — the
-extension is compiled and linked like any other target, so there is no dynamic
-loading and no ABI/RCE surface. Four cache variables drive it:
+registrar `void reg(aniparse::ParserStore::Edit&)`. This is **static composition**
+— the extension is compiled and linked like any other target, so there is no
+dynamic loading and no ABI/RCE surface. Four cache variables drive it (five with
+video extractors):
 
 ```
 cmake --preset x64-debug \
   -D ANIP_EXTENSION_SUBDIRS="/path/to/my-extensions" \  # add_subdirectory'd
   -D ANIP_EXTENSION_LIBS="my-ext" \                     # target(s) to link
   -D ANIP_EXTENSION_HEADERS="myext/Register.hpp" \      # declares the registrar
-  -D ANIP_EXTENSION_REGISTRARS="myext::emplace_my_parsers"
+  -D ANIP_EXTENSION_REGISTRARS="myext::emplace_my_parsers" \
+  -D ANIP_EXTENSION_EXTRACTOR_REGISTRARS="myext::emplace_my_extractors"  # optional
 ```
 
-Each registrar is called after the default set, so your parsers join the store
-alongside the showcase ones. A registrar is just:
+Each registrar is called on one open store edit after the default set, so your
+parsers join the store alongside the showcase ones and the whole composition
+commits — rebuilding the routing snapshot — exactly once. A registrar is just:
 
 ```cpp
 // myext/Register.hpp
-namespace myext { void emplace_my_parsers(aniparse::ParserStore& store); }
+namespace myext {
+// Add to an open edit; do NOT commit — the CLI commits after all registrars.
+void emplace_my_parsers(aniparse::ParserStore::Edit& edit);
+void emplace_my_extractors(aniparse::VideoExtractorStore::Edit& edit); // optional
+}
 ```
 
 Runtime plugin loading (`--extensions <dir>`) is intentionally not offered here:
@@ -65,22 +72,53 @@ opt-in C entry point over this same registrar seam.
 | Command | What it does |
 |---|---|
 | `list parsers` | the available sources and their capabilities |
+| `list extractors` | the available video extractors and their hosts |
 | `list filters` | the search-filter vocabulary and `--filter k=v` value syntax |
 | `support (latest\|search) -p <parser>` | what a source accepts: filters, sorts, flags |
 | `latest -p <parser> [--from N] [--limit N] [--sort S] [--asc]` | browse the newest manga, anime, or images |
 | `search -p <parser> [-q <query>] [--filter k=v ...] [--from N] [--limit N]` | search a source catalogue |
 | `parse <url>` / `parse -` | fetch a routed URL, or full info for search/latest JSON read from stdin |
-| `episodes <url> [--track ID] [--episode N] [--limit N]` | inspect an anime's tracks, episodes, or advertised playback sources |
-| `download [<url>] [--dest DIR] [--chapters 1-4,8] [--jobs N]` | save files |
+| `episodes <url>` / `episodes -` [--track ID] [--episode N] [--limit N] | inspect an anime's tracks, episodes, or advertised playback sources |
+| `extract (<url>\|-)` | resolve external player URL(s) into playable streams via the video extractors (`-`: URLs from stdin, one per line) |
+| `download (<url>|-) [--dest DIR] [--chapters 1-4,8] [--jobs N]` | save files |
+| `catalog apply <file>` / `catalog status` / `catalog clear` | validate + cache a volatile catalog file, inspect it, drop it |
 
 `search` takes `-q` and/or repeatable `--filter k=v` (`k=!v` excludes; different keys
 AND across axes). `download` saves an image container or a manga's chapters→pages
-(each file buffered; streaming/CBZ still to come); with **no** URL it reads the
-`--json` records that `search`/`latest` emit from stdin — closing the
-`anip search --json | … | anip download` pipe.
+(each file buffered; streaming/CBZ still to come); with `-` instead of a URL it
+reads the `--json` records that `search`/`latest` emit from stdin — closing the
+`anip search --json | … | anip download -` pipe. `episodes -` reads the same
+records (anime category only) and lists each one's playback hierarchy. `extract -`
+takes plain URLs instead — one per line — so it chains off the source URLs that
+`episodes --episode --json` advertises: `anip episodes <url> --episode 1 --json |
+jq -r '.sources[].stream_url' | anip extract -`.
 
 `--json` switches any command to machine-readable output; `--help` prints usage.
 Exit codes: `0` ok, `1` runtime error, `2` usage/validation error.
+
+## Volatile catalog (dev harness)
+
+`catalog apply <file>` validates a volatile-catalog payload and caches it at
+`anip-catalog.json` next to the executable (`ANIP_CATALOG=<path>` overrides the
+location); every later run of any verb applies it before routing, `catalog
+status` shows the cached summary, `catalog clear` drops it. This exercises the
+library's verify → decode → `CatalogManager::apply` pipeline for volatile
+domains, mirrors and selectors — for parsers under `"parsers"` and for video
+extractors under `"extractors"` (same `{domains, mirrors}` entry shape):
+
+```json
+{
+  "schema_version": 1,
+  "revision": 1,
+  "parsers":    { "ExampleParser": { "domains": ["parser-mirror.example"] } },
+  "extractors": { "ExampleExtractor": { "domains": ["player-mirror.example"] } }
+}
+```
+
+Keys are the exact, case-sensitive identifiers from `list parsers` /
+`list extractors`. The CLI has no pinned key, so signature verification is
+stubbed (a warning says so on `apply`) — this is a testing harness, not the
+production trust path.
 
 ## Authentication
 
@@ -134,20 +172,21 @@ anip --json search -p AniList -q "chainsaw man" --limit 2 | anip parse -
 anip episodes "<anime-url>"                         # available tracks, when the source has them
 anip episodes "<anime-url>" --track 123 --limit 10   # episodes on one track
 anip episodes "<anime-url>" --track 123 --episode 1  # advertised player/source for episode 1
+anip --json search -p <anime-source> -q naruto | anip episodes -   # same, from stdin records
 
 # machine-readable output, post-processed with jq (metadata, no download)
 anip --json search -p AniList -q naruto --limit 3 | jq -r '.[].title'
 
-# the search|download pipe — find, then save every result (no URL: read stdin).
+# the search|download pipe — find, then save every result ('-': read stdin).
 # search --json emits one {parser, handle} record per hit:
 anip --json search -p Danbooru -q landscape --limit 2
 # [{"offset":0,"title":"…","parser":"Danbooru","handle":{"url":"…","params":{}}}, …]
 # download rebuilds each getter from those handles (from_serialized) and saves it:
-anip --json search -p Danbooru -q landscape --limit 5 | anip download --dest ./out --jobs 8
+anip --json search -p Danbooru -q landscape --limit 5 | anip download - --dest ./out --jobs 8
 
 # the handle is opaque — stash the JSON, filter it later with jq, then download:
 anip --json search -p Danbooru -q scenery --limit 50 > feed.json
-jq '[.[] | select(.title | test("mountain"))]' feed.json | anip download --dest ./out
+jq '[.[] | select(.title | test("mountain"))]' feed.json | anip download - --dest ./out
 
 # download a single post URL directly; --chapters selects ranges for manga sources
 anip download "https://danbooru.donmai.us/posts/1234567" --dest ./out --jobs 8
@@ -155,5 +194,5 @@ anip download "<manga-url>" --chapters 1-4,8 --dest ./out
 
 # an authenticated source — env keeps the key out of argv, then pipe into download
 export ANIP_GELBOORU_USER=123456 ANIP_GELBOORU_PASSWORD=<api_key>
-anip --json search -p Gelbooru -q cat_ears --limit 10 | anip download --dest ./gel --jobs 4
+anip --json search -p Gelbooru -q cat_ears --limit 10 | anip download - --dest ./gel --jobs 4
 ```
