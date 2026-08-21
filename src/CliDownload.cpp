@@ -3,8 +3,8 @@
  *
  * The download verb and its dumping machinery: fetch an image container's items or a
  * manga's chapter pages and write them to disk, up to --jobs at a time, cancellable
- * via SIGINT. Also handles the stdin mode that consumes search/latest --json records
- * (from_serialized). Split out of main.cpp — the largest single block.
+ * via SIGINT. Also handles the `download -` stdin mode that consumes search/latest
+ * --json records (from_serialized). Split out of main.cpp — the largest single block.
  */
 #include "CliCommon.hpp"
 
@@ -422,11 +422,15 @@ int download(std::span<const std::string_view> args, bool json) {
 			++i; // consume the flag's value
 			continue;
 		}
-		if (a.starts_with('-')) {
+		if (a != "-" && a.starts_with('-')) {
 			continue;
 		}
 		url = a;
 		break;
+	}
+	if (!url) {
+		std::println(stderr, "{}: download needs a <url>, or '-' for search/latest JSON on stdin", program);
+		return Usage;
 	}
 	std::string dest = ".";
 	if (const auto d = flag_value(args, "--dest")) {
@@ -475,11 +479,12 @@ int download(std::span<const std::string_view> args, bool json) {
 
 	ParserStore store;
 	populate_store(store);
-	auto client = std::make_shared<AsyncClient>();
-	RequestorContext ctx(client);
+	CatalogServices services;
+	apply_cached_catalog(&store, nullptr, services);
+	RequestorContext ctx = services.parser_context();
 
 	// URL mode: a pasted container / manga URL.
-	if (url) {
+	if (*url != "-") {
 		std::optional<UrlRoute> route = store.route_url(*url);
 		if (!route) {
 			std::println(stderr, "{}: no source handles '{}'", program, *url);
@@ -514,9 +519,9 @@ int download(std::span<const std::string_view> args, bool json) {
 		return report(std::move(result), dest, json);
 	}
 
-	// stdin mode: consume the JSON that `search`/`latest --json` emits — records
-	// carrying {parser, handle} — and dump each via from_serialized. This is what
-	// closes `anip search --json | ... | anip download`.
+	// stdin mode (download -): consume the JSON that `search`/`latest --json`
+	// emits — records carrying {parser, handle} — and dump each via
+	// from_serialized. This is what closes `anip search --json | ... | anip download -`.
 	std::string input((std::istreambuf_iterator<char>(std::cin)),
 	                  std::istreambuf_iterator<char>());
 	// Some shells (PowerShell) prepend a UTF-8 BOM when piping to a native stdin;
@@ -525,7 +530,7 @@ int download(std::span<const std::string_view> args, bool json) {
 		input.erase(0, 3);
 	}
 	if (input.find_first_not_of(" \t\r\n") == std::string::npos) {
-		std::println(stderr, "{}: download needs a <url>, or JSON records on stdin", program);
+		std::println(stderr, "{}: download - needs JSON from search/latest --json on stdin", program);
 		return Usage;
 	}
 	boost::json::value doc;
@@ -534,7 +539,7 @@ int download(std::span<const std::string_view> args, bool json) {
 	} catch (const std::exception& e) {
 		std::println(stderr, "{}: stdin is not valid JSON ({}).", program, e.what());
 		std::println(stderr, "{}: pipe search/latest with --json, e.g. "
-		    "`{} --json search -p X -q foo | {} download`", program, program, program);
+		    "`{} --json search -p X -q foo | {} download -`", program, program, program);
 		return Usage;
 	}
 

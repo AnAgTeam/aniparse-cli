@@ -23,18 +23,25 @@ find_package(aniparse-parsers REQUIRED)
 #
 # The public binary ships only the showcase parsers. To build your own anip with
 # additional (e.g. private) parsers, point these at an extension library that
-# exposes a registrar `void reg(aniparse::ParserStore&)` — no dynamic loading, so
-# no ABI/RCE surface; the extension is compiled and linked like any other target.
+# exposes a registrar `void reg(aniparse::ParserStore::Edit&)` — no dynamic
+# loading, so no ABI/RCE surface; the extension is compiled and linked like any
+# other target. Registrars add to an open store edit without committing, so the
+# whole composition publishes exactly one routing snapshot. Video extractors
+# plug in separately through ANIP_EXTENSION_EXTRACTOR_REGISTRARS
+# (`void reg(aniparse::VideoExtractorStore::Edit&)`), declared by the same
+# headers.
 #
 #   cmake --preset x64-debug \
 #     -D ANIP_EXTENSION_SUBDIRS="../my-extensions" \
 #     -D ANIP_EXTENSION_LIBS="my-extensions" \
 #     -D ANIP_EXTENSION_HEADERS="my/extensions/Register.hpp" \
-#     -D ANIP_EXTENSION_REGISTRARS="myext::emplace_my_parsers"
+#     -D ANIP_EXTENSION_REGISTRARS="myext::emplace_my_parsers" \
+#     -D ANIP_EXTENSION_EXTRACTOR_REGISTRARS="myext::emplace_my_extractors"
 set(ANIP_EXTENSION_SUBDIRS    "" CACHE STRING "Source dirs to add_subdirectory before linking anip")
 set(ANIP_EXTENSION_LIBS       "" CACHE STRING "Extra targets to link into anip")
 set(ANIP_EXTENSION_HEADERS    "" CACHE STRING "Headers declaring the extension registrar functions")
-set(ANIP_EXTENSION_REGISTRARS "" CACHE STRING "Registrar functions, each void(aniparse::ParserStore&)")
+set(ANIP_EXTENSION_REGISTRARS "" CACHE STRING "Registrar functions, each void(aniparse::ParserStore::Edit&)")
+set(ANIP_EXTENSION_EXTRACTOR_REGISTRARS "" CACHE STRING "Registrar functions, each void(aniparse::VideoExtractorStore::Edit&)")
 
 # Bring extension targets into the build (unique binary dir per entry, since the
 # source dirs typically live outside this tree).
@@ -51,7 +58,11 @@ foreach(_hdr IN LISTS ANIP_EXTENSION_HEADERS)
 endforeach()
 set(ANIP_EXTENSION_CALLS "")
 foreach(_reg IN LISTS ANIP_EXTENSION_REGISTRARS)
-	string(APPEND ANIP_EXTENSION_CALLS "\t${_reg}(store);\n")
+	string(APPEND ANIP_EXTENSION_CALLS "\t${_reg}(edit);\n")
+endforeach()
+set(ANIP_EXTENSION_EXTRACTOR_CALLS "")
+foreach(_reg IN LISTS ANIP_EXTENSION_EXTRACTOR_REGISTRARS)
+	string(APPEND ANIP_EXTENSION_EXTRACTOR_CALLS "\t${_reg}(edit);\n")
 endforeach()
 configure_file(
 	"${CMAKE_CURRENT_LIST_DIR}/cmake/anip_extensions.hpp.in"
@@ -62,6 +73,7 @@ add_executable(anip
 	"src/main.cpp"
 	"src/CliFilters.cpp"
 	"src/CliDownload.cpp"
+	"src/CliCatalog.cpp"
 )
 
 set_property(TARGET anip PROPERTY CXX_STANDARD 23)

@@ -6,15 +6,25 @@
 //   ANIP_EXTENSION_SUBDIRS    dirs to add_subdirectory (bring targets into scope)
 //   ANIP_EXTENSION_LIBS       targets to link into anip
 //   ANIP_EXTENSION_HEADERS    headers declaring the registrar functions
-//   ANIP_EXTENSION_REGISTRARS registrar functions, each void(aniparse::ParserStore&)
+//   ANIP_EXTENSION_REGISTRARS registrar functions, each void(aniparse::ParserStore::Edit&)
+//   ANIP_EXTENSION_EXTRACTOR_REGISTRARS registrar functions, each void(aniparse::VideoExtractorStore::Edit&)
 #pragma once
 #include <aniparse/ParserStore.hpp>
+#include <aniparse/video/VideoExtractor.hpp>
 @ANIP_EXTENSION_INCLUDES@
 namespace aniparse::cli {
 
-/// Register every extension parser set linked into this build, after the
-/// default showcase set. A no-op when no extensions were configured.
-inline void register_extensions([[maybe_unused]] aniparse::ParserStore& store) {
+/// Add every extension parser set linked into this build to an already-open
+/// store edit, after the default showcase set. The caller commits the edit, so
+/// the whole registration publishes one routing snapshot. A no-op when no
+/// extensions were configured.
+inline void register_extensions([[maybe_unused]] aniparse::ParserStore::Edit& edit) {
 @ANIP_EXTENSION_CALLS@}
+
+/// Add every extension video-extractor set linked into this build to an
+/// already-open store edit, without committing. A no-op when no extractor
+/// registrars were configured.
+inline void register_extension_extractors([[maybe_unused]] aniparse::VideoExtractorStore::Edit& edit) {
+@ANIP_EXTENSION_EXTRACTOR_CALLS@}
 
 } // namespace aniparse::cli

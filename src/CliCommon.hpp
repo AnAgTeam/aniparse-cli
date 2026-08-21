@@ -17,11 +17,16 @@
 #include <aniparse/types/Search.hpp>
 #include <aniparse/types/Authentication.hpp>
 
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
+
+namespace aniparse {
+class VideoExtractorStore;
+}
 
 namespace aniparse::cli {
 
@@ -48,6 +53,32 @@ std::vector<std::string_view> capability_labels(const aniparse::CompatibilitiesF
 /// Build a store: the public showcase parsers plus any extension parser sets
 /// linked into this build (seam A — see cmake/anip_extensions.hpp.in).
 void populate_store(aniparse::ParserStore& store);
+
+// --- Volatile catalog (defined in CliCatalog.cpp) ---
+
+/// The shared service bundle for one verb run: an AsyncClient plus the swappable
+/// holders a catalog apply feeds (mirrors, selectors and resources on the
+/// parser-facing state; a separate mirror holder on the extractor-facing one).
+/// Build contexts from it only AFTER apply_cached_catalog() — a context
+/// snapshots the mirror source at construction.
+struct CatalogServices {
+	std::shared_ptr<aniparse::ServiceState> parsers;
+	std::shared_ptr<aniparse::ServiceState> extractors;
+
+	CatalogServices();
+	aniparse::RequestorContext parser_context() const;
+	aniparse::RequestorContext extractor_context() const;
+};
+
+/// Apply the cached volatile catalog (left by `catalog apply`, or at the
+/// ANIP_CATALOG path) to the given stores and the service holders. Either store
+/// may be null. No-op when no cache file exists; a rejected cache warns and the
+/// run continues on static domains. Signature verification is stubbed — dev tool.
+void apply_cached_catalog(aniparse::ParserStore* parser_store,
+                          aniparse::VideoExtractorStore* extractor_store,
+                          const CatalogServices& services);
+
+int catalog(std::span<const std::string_view> args, bool json);
 
 // --- Authentication (defined in main.cpp) ---
 
